@@ -33,12 +33,12 @@ import sys
 import tempfile
 import time
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable, Dict
-from typing import Generic, List, Mapping, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable, Deque
+from typing import Dict, Generic, List, Mapping, Optional, Protocol, Sequence
 from typing import Set, Tuple, Type, TypeVar, Union, cast
 from typing_extensions import Self
 
@@ -1017,6 +1017,11 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._next_recv_chan = 0
         self._max_recv_pktlen = _DEFAULT_RECV_PKTLEN
 
+        self._channel_send_quota = options.channel_send_quota
+        self._fair_send_queue: Deque[SSHChannel] = deque()
+        self._fair_send_set: Set[SSHChannel] = set()
+        self._fair_send_scheduled = False
+
         self._global_request_queue: List[_GlobalRequest] = []
         self._global_request_waiters: \
             'List[asyncio.Future[_GlobalRequestResult]]' = []
@@ -1089,6 +1094,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         for chan in list(self._channels.values()):
             chan.process_connection_close(exc)
+
+        self._fair_send_queue.clear()
+        self._fair_send_set.clear()
 
         for listener in list(self._local_listeners.values()):
             listener.close()
@@ -1491,6 +1499,66 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Remove the channel with the specified channel number"""
 
         del self._channels[recv_chan]
+
+    def schedule_channel_send(self, chan: SSHChannel) -> None:
+        """Schedule a channel's buffered data to be sent
+
+           When a per-round channel send quota is configured, sending
+           is deferred to a connection-level round-robin scheduler
+           which gives each channel with buffered data a chance to
+           send up to the configured number of bytes per round, so a
+           channel sending a large amount of data can't starve other
+           channels. Otherwise, the channel's send buffer is flushed
+           immediately.
+
+        """
+
+        if self._channel_send_quota is None:
+            chan._flush_send_buf() # pylint: disable=protected-access
+            return
+
+        if chan not in self._fair_send_set:
+            self._fair_send_set.add(chan)
+            self._fair_send_queue.append(chan)
+
+        chan._pause_resume_writing() # pylint: disable=protected-access
+
+        if not self._fair_send_scheduled:
+            self._fair_send_scheduled = True
+            self._loop.call_soon(self._flush_channel_sends)
+
+    def unschedule_channel_send(self, chan: SSHChannel) -> None:
+        """Remove a channel from the fair send scheduler"""
+
+        if chan in self._fair_send_set:
+            self._fair_send_set.discard(chan)
+            self._fair_send_queue.remove(chan)
+
+    def _flush_channel_sends(self) -> None:
+        """Flush queued channel sends, giving each channel a fair quota"""
+
+        # pylint: disable=protected-access
+
+        self._fair_send_scheduled = False
+
+        queue = self._fair_send_queue
+        quota = self._channel_send_quota
+
+        while queue:
+            chan = queue.popleft()
+
+            self._fair_send_set.discard(chan)
+
+            if chan._conn is not self:
+                continue
+
+            # Channels which still have data buffered after sending
+            # their quota re-schedule themselves from within this call.
+            # Channels with no available send window are skipped here,
+            # so they can't block other channels. They're re-scheduled
+            # when a window adjust arrives.
+            if chan._send_window:
+                chan._flush_send_buf(quota)
 
     def get_gss_context(self) -> GSSBase:
         """Return the GSS context associated with this connection"""
@@ -7388,6 +7456,7 @@ class SSHConnectionOptions(Options, Generic[_Options]):
     login_timeout: float
     keepalive_internal: float
     keepalive_count_max: int
+    channel_send_quota: Optional[int]
 
     def __init__(self, options: Optional[_Options] = None, **kwargs: object):
         last_config = options.config if options else None
@@ -7428,7 +7497,8 @@ class SSHConnectionOptions(Options, Generic[_Options]):
                 connect_timeout: Optional[Union[float, str]],
                 login_timeout: Union[float, str],
                 keepalive_interval: Union[float, str],
-                keepalive_count_max: int) -> None:
+                keepalive_count_max: int,
+                channel_send_quota: Optional[int]) -> None:
         """Prepare common connection configuration options"""
 
         def _split_cname_patterns(
@@ -7594,12 +7664,16 @@ class SSHConnectionOptions(Options, Generic[_Options]):
         if keepalive_count_max <= 0:
             raise ValueError('Keepalive count max cannot be negative or zero')
 
+        if channel_send_quota is not None and channel_send_quota <= 0:
+            raise ValueError('Channel send quota cannot be negative or zero')
+
         self.rekey_bytes = cast(int, rekey_bytes)
         self.rekey_seconds = cast(float, rekey_seconds)
         self.connect_timeout = connect_timeout or None
         self.login_timeout = login_timeout
         self.keepalive_interval = keepalive_interval
         self.keepalive_count_max = keepalive_count_max
+        self.channel_send_quota = channel_send_quota
 
 
 class SSHClientConnectionOptions(SSHConnectionOptions):
@@ -7900,6 +7974,14 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
            without getting a response before disconnecting from the
            server. This defaults to 3, but only applies when
            keepalive_interval is non-zero.
+       :param channel_send_quota: (optional)
+           The maximum number of bytes each channel is allowed to send
+           per round when fairly scheduling channel data on this
+           connection. When set, channels with buffered data take turns
+           sending up to this many bytes per round, so that a channel
+           sending a large amount of data can't starve other channels.
+           If not set, buffered channel data is sent as quickly as the
+           receive window allows.
        :param tcp_keepalive: (optional)
            Whether or not to enable keepalive probes at the TCP level to
            detect broken connections, defaulting to `True`.
@@ -8081,6 +8163,7 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
        :type login_timeout: *see* :ref:`SpecifyingTimeIntervals`
        :type keepalive_interval: *see* :ref:`SpecifyingTimeIntervals`
        :type keepalive_count_max: `int`
+       :type channel_send_quota: `int`
        :type tcp_keepalive: `bool`
        :type utf8_decode_errors: `str`
        :type canonicalize_hostname: `bool` or `'always'`
@@ -8227,7 +8310,8 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
                 x11_single_connection: bool = False,
                 encoding: Optional[str] = 'utf-8', errors: str = 'strict',
                 window: int = _DEFAULT_WINDOW,
-                max_pktsize: int = _DEFAULT_MAX_PKTSIZE) -> None:
+                max_pktsize: int = _DEFAULT_MAX_PKTSIZE,
+                channel_send_quota: Optional[int] = None) -> None:
         """Prepare client connection configuration options"""
 
         try:
@@ -8289,7 +8373,8 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
                         kbdint_auth, password_auth, x509_trusted_certs,
                         x509_trusted_cert_paths, x509_purposes, rekey_bytes,
                         rekey_seconds, connect_timeout, login_timeout,
-                        keepalive_interval, keepalive_count_max)
+                        keepalive_interval, keepalive_count_max,
+                        channel_send_quota)
 
         if known_hosts != ():
             self.known_hosts = known_hosts
@@ -8734,6 +8819,14 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
            without getting a response before disconnecting a client.
            This defaults to 3, but only applies when keepalive_interval is
            non-zero.
+       :param channel_send_quota: (optional)
+           The maximum number of bytes each channel is allowed to send
+           per round when fairly scheduling channel data on this
+           connection. When set, channels with buffered data take turns
+           sending up to this many bytes per round, so that a channel
+           sending a large amount of data can't starve other channels.
+           If not set, buffered channel data is sent as quickly as the
+           receive window allows.
        :param tcp_keepalive: (optional)
            Whether or not to enable keepalive probes at the TCP level to
            detect broken connections, defaulting to `True`.
@@ -8839,6 +8932,7 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
        :type login_timeout: *see* :ref:`SpecifyingTimeIntervals`
        :type keepalive_interval: *see* :ref:`SpecifyingTimeIntervals`
        :type keepalive_count_max: `int`
+       :type channel_send_quota: `int`
        :type tcp_keepalive: `bool`
        :type utf8_decode_errors: `str`
        :type canonicalize_hostname: `bool` or `'always'`
@@ -8945,7 +9039,8 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                 sftp_factory: Optional[SFTPServerFactory] = None,
                 sftp_version: int = MIN_SFTP_VERSION,
                 allow_scp: bool = False, window: int = _DEFAULT_WINDOW,
-                max_pktsize: int = _DEFAULT_MAX_PKTSIZE) -> None:
+                max_pktsize: int = _DEFAULT_MAX_PKTSIZE,
+                channel_send_quota: Optional[int] = None) -> None:
         """Prepare server connection configuration options"""
 
         config = SSHServerConfig.load(last_config, config, reload, canonical,
@@ -8984,7 +9079,8 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                         kbdint_auth, password_auth, x509_trusted_certs,
                         x509_trusted_cert_paths, x509_purposes,
                         rekey_bytes, rekey_seconds, connect_timeout,
-                        login_timeout, keepalive_interval, keepalive_count_max)
+                        login_timeout, keepalive_interval, keepalive_count_max,
+                        channel_send_quota)
 
         if server_host_keys == ():
             server_host_keys = cast(Sequence[str], config.get('HostKey'))

@@ -129,6 +129,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._send_paused = False
         self._send_buf: List[Tuple[bytearray, DataType]] = []
         self._send_buf_len = 0
+        self._close_after_eof = False
 
         self._recv_state = 'closed'
         self._init_recv_window = window
@@ -256,6 +257,9 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._send_buf = []
         self._send_buf_len = 0
 
+        if self._conn:
+            self._conn.unschedule_channel_send(self)
+
         if self._send_state != 'closed':
             self.send_packet(MSG_CHANNEL_CLOSE)
             self._send_chan = None
@@ -302,11 +306,31 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
                 assert self._session is not None
                 self._session.pause_writing()
 
-    def _flush_send_buf(self) -> None:
-        """Flush as much data in send buffer as the send window allows"""
+    def _schedule_send(self) -> None:
+        """Schedule buffered data to be sent on the connection"""
 
-        while self._send_buf and self._send_window:
+        if self._conn:
+            self._conn.schedule_channel_send(self)
+
+    def _flush_send_buf(self, max_bytes: Optional[int] = None) -> None:
+        """Flush as much data in send buffer as the send window allows
+
+           When max_bytes is set, at most that many bytes are sent. If
+           unsent data remains afterward, the channel re-schedules
+           itself with the connection, allowing other channels a chance
+           to send their buffered data first.
+
+        """
+
+        sent = 0
+
+        while self._send_buf and self._send_window and \
+                (max_bytes is None or sent < max_bytes):
             pktsize = min(self._send_window, self._send_pktsize)
+
+            if max_bytes is not None:
+                pktsize = min(pktsize, max_bytes - sent)
+
             buf, datatype = self._send_buf[0]
 
             if len(buf) > pktsize:
@@ -318,6 +342,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
             self._send_buf_len -= len(data)
             self._send_window -= len(data)
+            sent += len(data)
 
             if datatype is None:
                 self.send_packet(MSG_CHANNEL_DATA, String(data))
@@ -331,8 +356,13 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             if self._send_state == 'eof_pending':
                 self.send_packet(MSG_CHANNEL_EOF)
                 self._send_state = 'eof'
+
+                if self._close_after_eof:
+                    self._close_send()
             elif self._send_state == 'close_pending':
                 self._close_send()
+        elif max_bytes is not None and self._send_window:
+            self._schedule_send()
 
     def _flush_recv_buf(self, exc: Optional[Exception] = None) -> None:
         """Flush as much data in the recv buffer as the application allows"""
@@ -566,7 +596,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self.logger.debug2('Received window adjust of %d bytes, '
                            'new window %d', adjust, self._send_window)
 
-        self._flush_send_buf()
+        self._schedule_send()
 
     def _process_data(self, _pkttype: int, _pktid: int,
                       packet: SSHPacket) -> None:
@@ -777,10 +807,13 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         self.logger.info('Closing channel')
 
-        if self._send_state not in {'close_pending', 'closed'}:
+        if self._send_state == 'eof_pending':
+            # Send a close only after the pending EOF is sent
+            self._close_after_eof = True
+        elif self._send_state not in {'close_pending', 'closed'}:
             # Send a close only after sending unsent data
             self._send_state = 'close_pending'
-            self._flush_send_buf()
+            self._schedule_send()
 
         if self._recv_state != 'closed':
             # Discard unreceived data
@@ -947,7 +980,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         self._send_buf.append((bytearray(encoded_data), datatype))
         self._send_buf_len += datalen
-        self._flush_send_buf()
+        self._schedule_send()
 
     def writelines(self, list_of_data: Iterable[AnyStr],
                    datatype: DataType = None) -> None:
@@ -994,7 +1027,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         if self._send_state == 'open':
             self._send_state = 'eof_pending'
-            self._flush_send_buf()
+            self._schedule_send()
 
     def pause_reading(self) -> None:
         """Pause delivery of incoming data

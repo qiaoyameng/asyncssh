@@ -38,7 +38,7 @@ from asyncssh.constants import MSG_CHANNEL_DATA
 from asyncssh.constants import MSG_CHANNEL_EXTENDED_DATA
 from asyncssh.constants import MSG_CHANNEL_EOF, MSG_CHANNEL_CLOSE
 from asyncssh.constants import MSG_CHANNEL_SUCCESS
-from asyncssh.packet import Boolean, Byte, String, UInt32
+from asyncssh.packet import Boolean, Byte, SSHPacket, String, UInt32
 from asyncssh.public_key import CERT_TYPE_USER
 from asyncssh.stream import SSHTCPStreamSession, SSHUNIXStreamSession
 from asyncssh.stream import SSHTunTapStreamSession
@@ -2011,3 +2011,281 @@ class _TestConnectionDropbearServer(ServerTestCase):
             async with self.connect(compression_algs=None) as conn:
                 stdin, _, _ = await conn.open_session()
                 self.assertEqual(stdin.channel.get_send_pktsize(), 32759)
+
+
+class _FairSendServerSession(asyncssh.SSHServerSession):
+    """A server session which records the data it receives"""
+
+    def __init__(self):
+        self._chan = None
+        self.data = {None: [], asyncssh.EXTENDED_DATA_STDERR: []}
+        self.eof = False
+
+    def connection_made(self, chan):
+        """Handle session open"""
+
+        self._chan = chan
+
+    def shell_requested(self):
+        """Handle shell request"""
+
+        return True
+
+    def exec_requested(self, command):
+        """Handle exec request"""
+
+        # pylint: disable=unused-argument
+
+        return True
+
+    def data_received(self, data, datatype):
+        """Handle data from the channel"""
+
+        self.data[datatype].append(data)
+
+    def eof_received(self):
+        """Handle EOF on the channel"""
+
+        self.eof = True
+        return True
+
+
+class _FairSendServer(Server):
+    """Server for testing fair channel send scheduling"""
+
+    instances = []
+
+    def __init__(self):
+        super().__init__()
+
+        self.sessions = []
+        self.instances.append(self)
+
+    def session_requested(self):
+        """Handle a request to create a new session"""
+
+        session = _FairSendServerSession()
+        self.sessions.append(session)
+        return session
+
+
+def _record_channel_sends(conn):
+    """Record outgoing channel data packets on a connection"""
+
+    sent = []
+    orig_send_packet = conn.send_packet
+
+    def send_packet(pkttype, *args, **kwargs):
+        """Record channel data, extended data, and EOF packets"""
+
+        if pkttype in (MSG_CHANNEL_DATA, MSG_CHANNEL_EXTENDED_DATA,
+                       MSG_CHANNEL_EOF):
+            payload = args[0]
+            chan = int.from_bytes(payload[:4], 'big')
+
+            if pkttype == MSG_CHANNEL_DATA:
+                sent.append((pkttype, chan, payload[8:]))
+            elif pkttype == MSG_CHANNEL_EXTENDED_DATA:
+                sent.append((pkttype, chan, payload[12:]))
+            else:
+                sent.append((pkttype, chan, b''))
+
+        return orig_send_packet(pkttype, *args, **kwargs)
+
+    conn.send_packet = send_packet
+
+    return sent
+
+
+class _TestChannelFairSend(ServerTestCase):
+    """Unit tests for fair channel send scheduling"""
+
+    quota = 1024
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server for the tests to use"""
+
+        return await cls.create_server(_FairSendServer)
+
+    @asynctest
+    async def test_fair_send_interleaving(self):
+        """Test small messages interleaving with a large channel write"""
+
+        big_data = ''.join(str(i % 10) for i in range(8 * self.quota))
+
+        async with self.connect(channel_send_quota=self.quota) as conn:
+            chan1, _ = await _create_session(conn)
+            chan2, _ = await _create_session(conn)
+
+            sent = _record_channel_sends(conn)
+
+            chan1.write(big_data)
+            chan2.write('x')
+
+            for _ in range(2):
+                await asyncio.sleep(0)
+
+            chan1_id = chan1._send_chan # pylint: disable=protected-access
+            chan2_id = chan2._send_chan # pylint: disable=protected-access
+
+            chan1_idx = [idx for idx, (_, chan, _) in enumerate(sent)
+                         if chan == chan1_id]
+            chan2_idx = [idx for idx, (_, chan, _) in enumerate(sent)
+                         if chan == chan2_id]
+
+            # The small message goes out before the large write completes
+            self.assertGreater(chan2_idx[0], chan1_idx[0])
+            self.assertLess(chan2_idx[0], chan1_idx[-1])
+
+            chan1_data = [data for pkttype, chan, data in sent
+                          if chan == chan1_id and pkttype == MSG_CHANNEL_DATA]
+            chan2_data = [data for pkttype, chan, data in sent
+                          if chan == chan2_id and pkttype == MSG_CHANNEL_DATA]
+
+            # The large write is split into quota-sized packets, but the
+            # bytes sent on it remain in their original order
+            self.assertTrue(chan1_data)
+            self.assertTrue(all(len(data) <= self.quota
+                                for data in chan1_data))
+            self.assertEqual(b''.join(chan1_data), big_data.encode())
+
+            self.assertEqual(chan2_data, [b'x'])
+
+    @asynctest
+    async def test_fair_send_zero_window(self):
+        """Test a zero-window channel doesn't block other channels"""
+
+        async with self.connect(channel_send_quota=self.quota) as conn:
+            chan1, _ = await _create_session(conn)
+            chan2, _ = await _create_session(conn)
+
+            sent = _record_channel_sends(conn)
+
+            # Simulate chan1's send window being exhausted
+            chan1._send_window = 0 # pylint: disable=protected-access
+
+            chan1.write('blocked')
+            chan2.write('ok')
+
+            for _ in range(2):
+                await asyncio.sleep(0)
+
+            chan1_id = chan1._send_chan # pylint: disable=protected-access
+            chan2_id = chan2._send_chan # pylint: disable=protected-access
+
+            self.assertEqual([data for _, chan, data in sent
+                              if chan == chan1_id], [])
+            self.assertEqual([data for _, chan, data in sent
+                              if chan == chan2_id], [b'ok'])
+
+            # Buffered data flows once chan1's window is adjusted
+            chan1._process_window_adjust( # pylint: disable=protected-access
+                MSG_CHANNEL_WINDOW_ADJUST, 0, SSHPacket(UInt32(4*self.quota)))
+
+            for _ in range(2):
+                await asyncio.sleep(0)
+
+            self.assertEqual(b''.join(data for _, chan, data in sent
+                                      if chan == chan1_id), b'blocked')
+
+    @asynctest
+    async def test_fair_send_abort_queued_channel(self):
+        """Test aborting a channel queued for sending frees its buffer"""
+
+        async with self.connect(channel_send_quota=self.quota) as conn:
+            chan, _ = await _create_session(conn)
+
+            # pylint: disable=protected-access
+
+            chan._send_window = 0
+            chan.write('unsent')
+
+            self.assertEqual(chan.get_write_buffer_size(), 6)
+            self.assertIn(chan, conn._fair_send_set)
+
+            chan.abort()
+
+            self.assertEqual(chan.get_write_buffer_size(), 0)
+            self.assertNotIn(chan, conn._fair_send_set)
+
+            # The scheduled send flush runs cleanly after the abort
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            await chan.wait_closed()
+
+    @asynctest
+    async def test_fair_send_drain(self):
+        """Test drain waits for real backpressure to clear"""
+
+        async with self.connect(channel_send_quota=self.quota) as conn:
+            proc = await conn.create_process('test')
+            chan = proc.channel
+
+            chan.set_write_buffer_limits(high=1024)
+
+            # Simulate the send window being exhausted
+            chan._send_window = 0 # pylint: disable=protected-access
+
+            proc.stdin.write('x' * 2048)
+
+            drain_task = asyncio.ensure_future(proc.stdin.drain())
+
+            await asyncio.sleep(0.1)
+
+            # The buffered data hasn't been sent, so drain remains blocked
+            self.assertFalse(drain_task.done())
+
+            # pylint: disable=protected-access
+            chan._process_window_adjust(
+                MSG_CHANNEL_WINDOW_ADJUST, 0, SSHPacket(UInt32(65536)))
+
+            await asyncio.wait_for(drain_task, 5)
+
+
+class _TestChannelFairSendServer(ServerTestCase):
+    """Unit tests for fair channel send scheduling on the server side"""
+
+    quota = 1024
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server for the tests to use"""
+
+        return await cls.create_server(_FairSendServer,
+                                       channel_send_quota=cls.quota)
+
+    @asynctest
+    async def test_fair_send_data_stderr_eof_order(self):
+        """Test data, stderr, and EOF ordering within a channel"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn)
+
+            # pylint: disable=protected-access
+
+            server_session = _FairSendServer.instances[-1].sessions[-1]
+            server_chan = server_session._chan
+            server_conn = server_chan.get_connection()
+
+            sent = _record_channel_sends(server_conn)
+
+            server_chan.write('out1')
+            server_chan.write_stderr('err')
+            server_chan.write('out2')
+            server_chan.write_eof()
+            server_chan.close()
+
+            await chan.wait_closed()
+
+            types = [(pkttype, data) for pkttype, _, data in sent]
+
+            self.assertEqual(types, [(MSG_CHANNEL_DATA, b'out1'),
+                                     (MSG_CHANNEL_EXTENDED_DATA, b'err'),
+                                     (MSG_CHANNEL_DATA, b'out2'),
+                                     (MSG_CHANNEL_EOF, b'')])
+
+            self.assertEqual(session.recv_buf[None], ['out1', 'out2'])
+            self.assertEqual(session.recv_buf[asyncssh.EXTENDED_DATA_STDERR],
+                             ['err'])
