@@ -109,6 +109,7 @@ from .sftp import SFTPByteRangeLockRefused, SFTPDeletePending
 from .sftp import SFTPFileCorrupt, SFTPOwnerInvalid, SFTPGroupInvalid
 from .sftp import SFTPNoMatchingByteRangeLock
 from .sftp import SFTPConnectionLost, SFTPOpUnsupported
+from .sftp import SFTPCopyRangesError
 from .sftp import SFTPAttrs, SFTPVFSAttrs, SFTPName, SFTPLimits
 from .sftp import SEEK_SET, SEEK_CUR, SEEK_END
 
@@ -137,7 +138,8 @@ __all__ = [
     'ProtocolNotSupported', 'SEEK_CUR', 'SEEK_END', 'SEEK_SET',
     'SFTPAttrs', 'SFTPBadMessage', 'SFTPByteRangeLockConflict',
     'SFTPByteRangeLockRefused', 'SFTPCannotDelete', 'SFTPClient',
-    'SFTPClientFile', 'SFTPConnectionLost', 'SFTPDeletePending',
+    'SFTPClientFile', 'SFTPConnectionLost', 'SFTPCopyRangesError',
+    'SFTPDeletePending',
     'SFTPDirNotEmpty', 'SFTPEOFError', 'SFTPError', 'SFTPFailure',
     'SFTPFileAlreadyExists', 'SFTPFileCorrupt', 'SFTPFileIsADirectory',
     'SFTPGroupInvalid', 'SFTPInvalidFilename', 'SFTPInvalidHandle',

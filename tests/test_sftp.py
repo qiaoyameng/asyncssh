@@ -43,6 +43,7 @@ from asyncssh import SFTPNoMedia, SFTPNoSpaceOnFilesystem, SFTPQuotaExceeded
 from asyncssh import SFTPUnknownPrincipal, SFTPLockConflict, SFTPDirNotEmpty
 from asyncssh import SFTPNotADirectory, SFTPInvalidFilename, SFTPLinkLoop
 from asyncssh import SFTPCannotDelete, SFTPInvalidParameter
+from asyncssh import SFTPCopyRangesError
 from asyncssh import SFTPFileIsADirectory, SFTPByteRangeLockConflict
 from asyncssh import SFTPByteRangeLockRefused, SFTPDeletePending
 from asyncssh import SFTPFileCorrupt, SFTPOwnerInvalid, SFTPGroupInvalid
@@ -65,7 +66,7 @@ from asyncssh import FILEXFER_TYPE_UNKNOWN, FILEXFER_TYPE_SOCKET
 from asyncssh import FILEXFER_TYPE_CHAR_DEVICE, FILEXFER_TYPE_BLOCK_DEVICE
 from asyncssh import FILEXFER_TYPE_FIFO
 from asyncssh import FILEXFER_ATTR_BITS_READONLY, FILEXFER_ATTR_KNOWN_TEXT
-from asyncssh import FX_OK, scp
+from asyncssh import FX_OK, FX_FAILURE, scp
 
 from asyncssh.misc import make_sparse_file
 
@@ -1361,6 +1362,149 @@ class _TestSFTP(_CheckSFTP):
                     await sftp.remote_copy(f, f)
         finally:
             remove('file')
+
+    @sftp_test
+    async def test_remote_copy_ranges(self, sftp):
+        """Test copying multiple ranges of a sparse remote file"""
+
+        try:
+            self._create_file('src', b'AAAA', offsets=(0, 65536))
+
+            result = await sftp.remote_copy_ranges(
+                'src', 'dst', [(0, 0, 4), (4, 4, 100), (65536, 104, 4)])
+
+            self.assertEqual(result, [4, 100, 4])
+
+            with open('dst', 'rb') as f:
+                self.assertEqual(f.read(), b'AAAA' + bytes(100) + b'AAAA')
+        finally:
+            remove('src dst')
+
+    @sftp_test
+    async def test_remote_copy_ranges_overlap(self, sftp):
+        """Test overlapping ranges in the same remote file"""
+
+        try:
+            self._create_file('file', b'0123456789abcdef')
+
+            async with sftp.open('file', 'r+b') as f:
+                result = await sftp.remote_copy_ranges(
+                    f, f, [(0, 8, 8), (8, 16, 8)])
+
+            self.assertEqual(result, [8, 8])
+
+            # All reads should see the file's contents as they were
+            # before the copy, even where they overlap regions written
+            # by earlier ranges in the same request
+
+            with open('file', 'rb') as f:
+                self.assertEqual(f.read(), b'012345670123456789abcdef')
+        finally:
+            remove('file')
+
+    @sftp_test
+    async def test_remote_copy_ranges_short_source(self, sftp):
+        """Test remote range copy with a short source file"""
+
+        try:
+            self._create_file('src', b'0123456789')
+
+            # The first range extends past the end of the source, the
+            # second starts beyond it, and the third copies to the end
+            # of the file
+
+            result = await sftp.remote_copy_ranges(
+                'src', 'dst', [(0, 0, 20), (100, 20, 5), (4, 30, 0)])
+
+            self.assertEqual(result, [10, 0, 6])
+
+            with open('dst', 'rb') as f:
+                self.assertEqual(f.read(), b'0123456789' + bytes(20) +
+                                 b'456789')
+        finally:
+            remove('src dst')
+
+    @sftp_test
+    async def test_remote_copy_ranges_error(self, sftp):
+        """Test a remote range copy which fails partway through"""
+
+        sftp_read = SFTPServer.read
+
+        def _read(self, file_obj, offset, size):
+            """Fail a read at offset 8"""
+
+            if offset == 8:
+                raise SFTPFailure('Read failed')
+
+            return sftp_read(self, file_obj, offset, size)
+
+        try:
+            self._create_file('src', b'0123456789abcdef')
+
+            with patch('asyncssh.sftp.SFTPServer.read', _read):
+                with self.assertRaises(SFTPCopyRangesError) as cm:
+                    await sftp.remote_copy_ranges(
+                        'src', 'dst', [(0, 0, 8), (8, 8, 8), (12, 16, 4)])
+
+            # The results should report the range which completed before
+            # the failure and the range which failed, and the completed
+            # range should remain visible in the destination file
+
+            self.assertEqual(cm.exception.results,
+                             [(FX_OK, 8), (FX_FAILURE, 0)])
+
+            with open('dst', 'rb') as f:
+                self.assertEqual(f.read(), b'01234567')
+        finally:
+            remove('src dst')
+
+    def test_remote_copy_ranges_fallback(self):
+        """Test remote range copy falling back to copy-data requests"""
+
+        @sftp_test
+        async def _test_remote_copy_ranges_fallback(self, sftp):
+            """Test remote range copy without the copy-ranges extension"""
+
+            try:
+                self._create_file('file', b'0123456789abcdef')
+
+                async with sftp.open('file', 'r+b') as f:
+                    result = await sftp.remote_copy_ranges(
+                        f, f, [(0, 8, 8), (8, 16, 8)])
+
+                self.assertEqual(result, [8, 8])
+
+                with open('file', 'rb') as f:
+                    self.assertEqual(f.read(), b'012345670123456789abcdef')
+            finally:
+                remove('file')
+
+        extensions = [(name, data) for name, data in
+                      SFTPServerHandler._extensions
+                      if name != b'copy-ranges@asyncssh.com']
+
+        with patch('asyncssh.sftp.SFTPServerHandler._extensions', extensions):
+            # pylint: disable=no-value-for-parameter
+            _test_remote_copy_ranges_fallback(self)
+
+    def test_remote_copy_ranges_unsupported(self):
+        """Test remote range copy on a server which doesn't support it"""
+
+        @sftp_test
+        async def _test_remote_copy_ranges_unsupported(self, sftp):
+            """Test remote range copy not being supported"""
+
+            try:
+                self._create_file('src')
+
+                with self.assertRaises(SFTPOpUnsupported):
+                    await sftp.remote_copy_ranges('src', 'dst', [(0, 0, 4)])
+            finally:
+                remove('src')
+
+        with patch('asyncssh.sftp.SFTPServerHandler._extensions', []):
+            # pylint: disable=no-value-for-parameter
+            _test_remote_copy_ranges_unsupported(self)
 
     @sftp_test
     async def test_oversized_sftp_write(self, sftp):
