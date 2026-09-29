@@ -129,6 +129,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._send_paused = False
         self._send_buf: List[Tuple[bytearray, DataType]] = []
         self._send_buf_len = 0
+        self._fair_send_queued = False
 
         self._recv_state = 'closed'
         self._init_recv_window = window
@@ -255,6 +256,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         # Discard unsent data
         self._send_buf = []
         self._send_buf_len = 0
+        self._fair_send_queued = False
 
         if self._send_state != 'closed':
             self.send_packet(MSG_CHANNEL_CLOSE)
@@ -305,8 +307,17 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
     def _flush_send_buf(self) -> None:
         """Flush as much data in send buffer as the send window allows"""
 
-        while self._send_buf and self._send_window:
+        conn = self._conn
+        quota = conn.get_fair_send_quota() if conn else None
+        budget = quota
+
+        while self._send_buf and self._send_window and \
+                (budget is None or budget > 0):
             pktsize = min(self._send_window, self._send_pktsize)
+
+            if budget is not None:
+                pktsize = min(pktsize, budget)
+
             buf, datatype = self._send_buf[0]
 
             if len(buf) > pktsize:
@@ -318,6 +329,9 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
             self._send_buf_len -= len(data)
             self._send_window -= len(data)
+
+            if budget is not None:
+                budget -= len(data)
 
             if datatype is None:
                 self.send_packet(MSG_CHANNEL_DATA, String(data))
@@ -333,6 +347,10 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
                 self._send_state = 'eof'
             elif self._send_state == 'close_pending':
                 self._close_send()
+        elif budget == 0 and self._send_window and conn:
+            # Quota exhausted with data still left to send -- queue the
+            # channel for another round of fair sending
+            conn._queue_fair_send(self) # pylint: disable=protected-access
 
     def _flush_recv_buf(self, exc: Optional[Exception] = None) -> None:
         """Flush as much data in the recv buffer as the application allows"""

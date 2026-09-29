@@ -38,7 +38,7 @@ from asyncssh.constants import MSG_CHANNEL_DATA
 from asyncssh.constants import MSG_CHANNEL_EXTENDED_DATA
 from asyncssh.constants import MSG_CHANNEL_EOF, MSG_CHANNEL_CLOSE
 from asyncssh.constants import MSG_CHANNEL_SUCCESS
-from asyncssh.packet import Boolean, Byte, String, UInt32
+from asyncssh.packet import Boolean, Byte, String, UInt32, SSHPacket
 from asyncssh.public_key import CERT_TYPE_USER
 from asyncssh.stream import SSHTCPStreamSession, SSHUNIXStreamSession
 from asyncssh.stream import SSHTunTapStreamSession
@@ -137,6 +137,18 @@ async def _create_session(conn, command=None, *, subsystem=None, **kwargs):
 
     return await conn.create_session(_ClientSession, command,
                                      subsystem=subsystem, **kwargs)
+
+
+class _RecordClientSession(asyncssh.SSHClientSession):
+    """Client session which records the order of received data"""
+
+    def __init__(self):
+        self.received = []
+
+    def data_received(self, data, datatype):
+        """Record received data and its associated data type"""
+
+        self.received.append((datatype, data))
 
 
 class _ServerChannel(asyncssh.SSHServerChannel):
@@ -504,6 +516,22 @@ class _ChannelServer(Server):
         elif action == 'send_pktsize':
             stdout.write(str(stdout.channel.get_send_pktsize()))
             stdout.close()
+        elif action == 'discard':
+            async for _ in stdin:
+                pass
+        elif action == 'fair_send_stderr':
+            chan = stdout.channel
+
+            self._conn.set_fair_send_quota(8)
+
+            chan._send_window = 0
+
+            stdout.write('a' * 16)
+            stderr.write('b' * 16)
+            stdout.write('c' * 16)
+
+            chan._send_window = 48
+            chan._flush_send_buf()
         else:
             stdin.channel.exit(255)
 
@@ -1693,6 +1721,180 @@ class _TestChannel(ServerTestCase):
             chan, _ = await _create_session(conn, 'window_after_close')
 
             await chan.wait_closed()
+
+    @asynctest
+    async def test_fair_send(self):
+        """Test fair sending of data queued on multiple channels"""
+
+        async with self.connect() as conn:
+            chan1, _ = await _create_session(conn, encoding=None)
+            chan2, _ = await _create_session(conn, encoding=None)
+            chan3, _ = await _create_session(conn, encoding=None)
+
+            sent = []
+
+            orig_send_packet = conn.send_packet
+
+            def send_packet(pkttype, *args, **kwargs):
+                """Record outgoing channel data and EOF packets"""
+
+                if pkttype in (MSG_CHANNEL_DATA, MSG_CHANNEL_EOF):
+                    packet = SSHPacket(args[0])
+                    sender = packet.get_uint32()
+                    data = packet.get_string() \
+                        if pkttype == MSG_CHANNEL_DATA else b''
+
+                    sent.append((pkttype, sender, data))
+
+                orig_send_packet(pkttype, *args, **kwargs)
+
+            conn.send_packet = send_packet
+
+            conn.set_fair_send_quota(8)
+
+            # Prevent any data from being sent initially
+            chan1._send_window = 0
+            chan2._send_window = 0
+            chan3._send_window = 0
+
+            data1 = bytes(range(40))
+            data2 = bytes(range(40, 60))
+            data3 = b'x' * 16
+
+            chan1.write(data1)
+            chan2.write(data2)
+            chan2.write_eof()
+            chan3.write(data3)
+
+            # With no send window available, nothing should be sent
+            self.assertEqual(sent, [])
+
+            send_chan1 = chan1._send_chan
+            send_chan2 = chan2._send_chan
+            send_chan3 = chan3._send_chan
+
+            # Open the send windows on the first two channels only
+            chan1._send_window = len(data1)
+            chan2._send_window = len(data2)
+            chan1._flush_send_buf()
+            chan2._flush_send_buf()
+
+            await asyncio.sleep(0.1)
+
+            # The channels with open windows should alternate rounds, so
+            # chan2's small writes are interleaved with chan1's larger
+            # transfer, while byte order on each channel is preserved
+            self.assertEqual(sent, [
+                (MSG_CHANNEL_DATA, send_chan1, data1[0:8]),
+                (MSG_CHANNEL_DATA, send_chan2, data2[0:8]),
+                (MSG_CHANNEL_DATA, send_chan1, data1[8:16]),
+                (MSG_CHANNEL_DATA, send_chan2, data2[8:16]),
+                (MSG_CHANNEL_DATA, send_chan1, data1[16:24]),
+                (MSG_CHANNEL_DATA, send_chan2, data2[16:20]),
+                (MSG_CHANNEL_EOF, send_chan2, b''),
+                (MSG_CHANNEL_DATA, send_chan1, data1[24:32]),
+                (MSG_CHANNEL_DATA, send_chan1, data1[32:40])
+            ])
+
+            # The channel with no send window should have sent nothing,
+            # without blocking the other channels
+            self.assertEqual(chan3.get_write_buffer_size(), len(data3))
+            self.assertNotIn(send_chan3, {sender for _, sender, _ in sent})
+
+    @asynctest
+    async def test_fair_send_stderr(self):
+        """Test fair sending preserves data, stderr, and EOF ordering"""
+
+        async with self.connect() as conn:
+            chan, session = await conn.create_session(
+                _RecordClientSession, 'fair_send_stderr', encoding=None)
+
+            await chan.wait_closed()
+
+            stderr = asyncssh.EXTENDED_DATA_STDERR
+
+            self.assertEqual(session.received, [
+                (None, b'a' * 8), (None, b'a' * 8),
+                (stderr, b'b' * 8), (stderr, b'b' * 8),
+                (None, b'c' * 8), (None, b'c' * 8)
+            ])
+
+    @asynctest
+    async def test_fair_send_close_queued(self):
+        """Test closing a channel with data queued for fair sending"""
+
+        async with self.connect() as conn:
+            chan, _ = await _create_session(conn, 'discard', encoding=None)
+
+            conn.set_fair_send_quota(8)
+
+            chan._send_window = 0
+            chan.write(b'x' * 32)
+
+            chan._send_window = 16
+            chan._flush_send_buf()
+
+            # One round of data is sent, with the rest left queued
+            self.assertEqual(chan.get_write_buffer_size(), 24)
+
+            chan.abort()
+
+            # Aborting the channel discards its queued data
+            self.assertEqual(chan.get_write_buffer_size(), 0)
+
+            # The queued fair send round should be harmless
+            await asyncio.sleep(0.1)
+
+            self.assertEqual(chan.get_write_buffer_size(), 0)
+
+    @asynctest
+    async def test_fair_send_disable(self):
+        """Test disabling fair sending flushes queued data immediately"""
+
+        async with self.connect() as conn:
+            chan, _ = await _create_session(conn, encoding=None)
+
+            conn.set_fair_send_quota(8)
+
+            chan._send_window = 64
+            chan.write(b'x' * 32)
+
+            # One round of data is sent, with the rest left queued
+            self.assertEqual(chan.get_write_buffer_size(), 24)
+
+            conn.set_fair_send_quota(None)
+
+            # Disabling fair sending flushes the remaining data
+            self.assertEqual(chan.get_write_buffer_size(), 0)
+
+            with self.assertRaises(ValueError):
+                conn.set_fair_send_quota(0)
+
+    @asynctest
+    async def test_fair_send_drain(self):
+        """Test drain with fair sending reflects real backpressure"""
+
+        async with self.connect() as conn:
+            process = await conn.create_process('echo', encoding=None)
+            chan = process.channel
+
+            conn.set_fair_send_quota(8)
+
+            chan.set_write_buffer_limits(high=8, low=0)
+
+            chan._send_window = 0
+            process.stdin.write(b'x' * 40)
+
+            chan._send_window = 40
+            chan._flush_send_buf()
+
+            # Only one round of data can be sent immediately
+            self.assertEqual(chan.get_write_buffer_size(), 32)
+
+            # Drain should complete only after all data is actually sent
+            await asyncio.wait_for(process.stdin.drain(), 5)
+
+            self.assertEqual(chan.get_write_buffer_size(), 0)
 
     @asynctest
     async def test_empty_data(self):

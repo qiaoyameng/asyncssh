@@ -33,12 +33,12 @@ import sys
 import tempfile
 import time
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable, Dict
-from typing import Generic, List, Mapping, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable, Deque
+from typing import Dict, Generic, List, Mapping, Optional, Protocol, Sequence
 from typing import Set, Tuple, Type, TypeVar, Union, cast
 from typing_extensions import Self
 
@@ -1017,6 +1017,10 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._next_recv_chan = 0
         self._max_recv_pktlen = _DEFAULT_RECV_PKTLEN
 
+        self._fair_send_quota: Optional[int] = None
+        self._fair_send_queue: 'Deque[SSHChannel]' = deque()
+        self._fair_send_scheduled = False
+
         self._global_request_queue: List[_GlobalRequest] = []
         self._global_request_waiters: \
             'List[asyncio.Future[_GlobalRequestResult]]' = []
@@ -1086,6 +1090,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Clean up this connection"""
 
         self._cancel_keepalive_timer()
+
+        self._fair_send_queue.clear()
+        self._fair_send_scheduled = False
 
         for chan in list(self._channels.values()):
             chan.process_connection_close(exc)
@@ -1491,6 +1498,77 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Remove the channel with the specified channel number"""
 
         del self._channels[recv_chan]
+
+    def get_fair_send_quota(self) -> Optional[int]:
+        """Return the per-round fair send quota for channels
+
+           This method returns the maximum number of bytes each channel
+           is allowed to send per round when fair send mode is enabled,
+           or `None` if fair send mode is disabled.
+
+        """
+
+        return self._fair_send_quota
+
+    def set_fair_send_quota(self, quota: Optional[int]) -> None:
+        """Enable or disable fair sending across channels
+
+           When a quota is set, channel data is sent round-robin across
+           all channels with pending data, with each channel limited to
+           at most `quota` bytes per round. This prevents a channel
+           sending large amounts of data from starving other channels
+           on the same connection. Channels whose send window is
+           exhausted don't take a turn, so they can't block other
+           channels from making progress.
+
+           Setting the quota to `None` disables fair send mode,
+           causing each channel's buffered data to be sent immediately
+           as window space becomes available.
+
+           :param quota:
+               The maximum number of bytes a channel may send per
+               round, or `None` to disable fair send mode
+           :type quota: `int` or `None`
+
+        """
+
+        if quota is not None and quota <= 0:
+            raise ValueError('Fair send quota must be a positive integer')
+
+        self._fair_send_quota = quota
+
+        if quota is None:
+            while self._fair_send_queue:
+                chan = self._fair_send_queue.popleft()
+                chan._fair_send_queued = False # pylint: disable=protected-access
+
+            self._fair_send_scheduled = False
+
+        for chan in list(self._channels.values()):
+            chan._flush_send_buf() # pylint: disable=protected-access
+
+    def _queue_fair_send(self, chan: SSHChannel[AnyStr]) -> None:
+        """Queue a channel for a round of fair sending"""
+
+        # pylint: disable=protected-access
+
+        if not chan._fair_send_queued:
+            chan._fair_send_queued = True
+            self._fair_send_queue.append(chan)
+
+        if not self._fair_send_scheduled:
+            self._fair_send_scheduled = True
+            self._loop.call_soon(self._service_fair_send_queue)
+
+    def _service_fair_send_queue(self) -> None:
+        """Run a single round of fair sending across queued channels"""
+
+        self._fair_send_scheduled = False
+
+        for _ in range(len(self._fair_send_queue)):
+            chan = self._fair_send_queue.popleft()
+            chan._fair_send_queued = False # pylint: disable=protected-access
+            chan._flush_send_buf() # pylint: disable=protected-access
 
     def get_gss_context(self) -> GSSBase:
         """Return the GSS context associated with this connection"""

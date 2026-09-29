@@ -290,6 +290,8 @@ Connection Classes
    .. automethod:: get_extra_info
    .. automethod:: set_extra_info
    .. automethod:: set_keepalive
+   .. automethod:: get_fair_send_quota
+   .. automethod:: set_fair_send_quota
    .. automethod:: get_server_host_key
    .. automethod:: send_debug
    .. automethod:: is_closed
@@ -367,6 +369,8 @@ Connection Classes
    .. automethod:: get_extra_info
    .. automethod:: set_extra_info
    .. automethod:: set_keepalive
+   .. automethod:: get_fair_send_quota
+   .. automethod:: set_fair_send_quota
    .. automethod:: send_debug
    .. automethod:: is_closed
    ============================== =
