@@ -566,7 +566,7 @@ class ServerAuth(Auth):
         """Send a user authentication success response"""
 
         if self._conn.auth is self:
-            await self._conn.send_userauth_success()
+            await self._conn.auth_factor_succeeded(self._method)
 
 
 class _ServerNullAuth(ServerAuth):
@@ -809,7 +809,14 @@ class _ServerPublicKeyAuth(ServerAuth):
 
         if (await self._conn.validate_public_key(self._username, key_data,
                                                  msg, signature)):
-            if sig_present:
+            if self._conn.auth_key_reused(key_data):
+                # A key which already completed an auth factor can't be
+                # used again to satisfy an additional factor
+                self.logger.debug1('Key already used to complete a '
+                                   'previous auth factor')
+                self.send_failure()
+            elif sig_present:
+                self._conn.record_auth_key(key_data)
                 await self.send_success()
             else:
                 self.send_packet(MSG_USERAUTH_PK_OK, String(algorithm),

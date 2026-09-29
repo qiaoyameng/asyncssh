@@ -30,8 +30,9 @@ from unittest.mock import patch
 from cryptography.exceptions import UnsupportedAlgorithm
 
 import asyncssh
+from asyncssh.constants import MSG_CHANNEL_OPEN, MSG_USERAUTH_FAILURE
 from asyncssh.misc import async_context_manager, write_file
-from asyncssh.packet import String
+from asyncssh.packet import Boolean, NameList, String, SSHPacket, UInt32
 from asyncssh.public_key import CERT_TYPE_USER, CERT_TYPE_HOST
 
 from .keysign_stub import create_subprocess_exec_stub
@@ -2290,3 +2291,339 @@ class _TestServerLoginTimeoutDisabled(ServerTestCase):
 
         async with self.connect(username='ckey', client_keys='ckey'):
             pass
+
+
+class _AuthPolicyServer(Server):
+    """Server for testing multi-factor authentication policies"""
+
+    def begin_auth(self, username):
+        """Handle client authentication request"""
+
+        # pylint: disable=unused-argument
+
+        return True
+
+    def public_key_auth_supported(self):
+        """Return whether or not public key authentication is supported"""
+
+        return True
+
+    def password_auth_supported(self):
+        """Return whether or not password authentication is supported"""
+
+        return True
+
+    def validate_password(self, username, password):
+        """Return whether password is valid for this user"""
+
+        # pylint: disable=unused-argument
+
+        return password == 'pw'
+
+
+class _RecordingClientConnection(asyncssh.SSHClientConnection):
+    """Test client connection which records partial auth success responses"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.partial_auth_methods = []
+
+    def _process_userauth_failure(self, pkttype, pktid, packet):
+        """Record auth methods advertised on partial auth success"""
+
+        auth_methods = packet.get_namelist()
+        partial_success = packet.get_boolean()
+
+        if partial_success:
+            self.partial_auth_methods.append(list(auth_methods))
+
+        super()._process_userauth_failure(
+            pkttype, pktid, SSHPacket(NameList(auth_methods) +
+                                      Boolean(partial_success)))
+
+    _packet_handlers = dict(asyncssh.SSHClientConnection._packet_handlers)
+    _packet_handlers[MSG_USERAUTH_FAILURE] = _process_userauth_failure
+
+
+class _UsernameSwitchClientConnection(asyncssh.SSHClientConnection):
+    """Test client connection which switches users after partial success"""
+
+    def _process_userauth_failure(self, pkttype, pktid, packet):
+        """Switch to a different username on partial auth success"""
+
+        auth_methods = packet.get_namelist()
+        partial_success = packet.get_boolean()
+
+        if partial_success:
+            self._username = 'other'
+
+        super()._process_userauth_failure(
+            pkttype, pktid, SSHPacket(NameList(auth_methods) +
+                                      Boolean(partial_success)))
+
+    _packet_handlers = dict(asyncssh.SSHClientConnection._packet_handlers)
+    _packet_handlers[MSG_USERAUTH_FAILURE] = _process_userauth_failure
+
+
+class _EarlyChannelClientConnection(asyncssh.SSHClientConnection):
+    """Test client connection which opens a channel before auth completes"""
+
+    def _process_userauth_failure(self, pkttype, pktid, packet):
+        """Attempt to open a session channel on partial auth success"""
+
+        auth_methods = packet.get_namelist()
+        partial_success = packet.get_boolean()
+
+        if partial_success:
+            # Bypass the client-side deferral of non-auth messages until
+            # auth completes, to confirm the server rejects a session
+            # channel open sent before authentication is complete
+            self._auth_complete = True
+            self.send_packet(MSG_CHANNEL_OPEN, String('session'),
+                             UInt32(0), UInt32(0x100000), UInt32(0x8000))
+            self._auth_complete = False
+
+        super()._process_userauth_failure(
+            pkttype, pktid, SSHPacket(NameList(auth_methods) +
+                                      Boolean(partial_success)))
+
+    _packet_handlers = dict(asyncssh.SSHClientConnection._packet_handlers)
+    _packet_handlers[MSG_USERAUTH_FAILURE] = _process_userauth_failure
+
+
+class _StallPasswordClient(asyncssh.SSHClient):
+    """Test client which stalls after completing public key auth"""
+
+    async def password_auth_requested(self):
+        """Delay before failing to provide a password"""
+
+        await asyncio.sleep(5)
+
+        return None
+
+
+async def _exit_process(process):
+    """Handle a new SSH server process by exiting immediately"""
+
+    process.exit(0)
+
+
+class _TestAuthPolicy(ServerTestCase):
+    """Unit tests for multi-factor authentication policies"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server with a public key plus password auth policy"""
+
+        return await cls.create_server(
+            _AuthPolicyServer, authorized_client_keys='authorized_keys',
+            auth_policy=['publickey', 'password'])
+
+    @async_context_manager
+    async def _listen_policy(self, auth_policy, **kwargs):
+        """Start a server with a custom auth policy"""
+
+        kwargs.setdefault('server_factory', _AuthPolicyServer)
+
+        return await self.listen(authorized_client_keys='authorized_keys',
+                                 auth_policy=auth_policy, **kwargs)
+
+    @async_context_manager
+    async def _connect_policy(self, server, **kwargs):
+        """Open a connection to a custom policy server"""
+
+        return await self.connect(port=server.get_port(), agent_path=None,
+                                  known_hosts=(['skey.pub'], [], []),
+                                  **kwargs)
+
+    @asynctest
+    async def test_get_server_auth_methods(self):
+        """Test only the first auth policy stage is advertised"""
+
+        auth_methods = await asyncssh.get_server_auth_methods(
+            self._server_addr, self._server_port)
+
+        self.assertEqual(auth_methods, ['publickey'])
+
+    @asynctest
+    async def test_and_policy(self):
+        """Test auth policy requiring public key and password auth"""
+
+        async with self.connect(username='ckey', client_keys='ckey',
+                                password='pw', agent_path=None):
+            pass
+
+    @asynctest
+    async def test_and_policy_session(self):
+        """Test opening a session after completing an auth policy"""
+
+        async with self._listen_policy(['publickey', 'password'],
+                                       process_factory=_exit_process) \
+                as server:
+            async with self._connect_policy(
+                    server, username='ckey', client_keys='ckey',
+                    password='pw') as conn:
+                result = await conn.run('true')
+
+                self.assertEqual(result.exit_status, 0)
+
+    @asynctest
+    async def test_and_policy_wrong_password(self):
+        """Test auth policy with an incorrect password"""
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='ckey', client_keys='ckey',
+                               password='xxx', agent_path=None)
+
+    @asynctest
+    async def test_and_policy_missing_factor(self):
+        """Test auth policy with only a single completed factor"""
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='ckey', client_keys='ckey',
+                               agent_path=None)
+
+    @asynctest
+    async def test_partial_success_methods(self):
+        """Test only the next auth policy stage is advertised"""
+
+        with patch('asyncssh.connection.SSHClientConnection',
+                   _RecordingClientConnection):
+            async with self.connect(username='ckey', client_keys='ckey',
+                                    password='pw', agent_path=None) as conn:
+                pass
+
+        self.assertEqual(conn.partial_auth_methods, [[b'password']])
+
+    @asynctest
+    async def test_or_policy_stage(self):
+        """Test auth policy stage allowing multiple methods"""
+
+        async with self._listen_policy(
+                [['publickey'], ['password', 'keyboard-interactive']]) \
+                as server:
+            with patch('asyncssh.connection.SSHClientConnection',
+                       _RecordingClientConnection):
+                async with self._connect_policy(
+                        server, username='ckey', client_keys='ckey',
+                        password='pw') as conn:
+                    pass
+
+            self.assertEqual(conn.partial_auth_methods,
+                             [[b'keyboard-interactive', b'password']])
+
+    @asynctest
+    async def test_single_factor_policy(self):
+        """Test auth policy requiring only a single factor"""
+
+        async with self._listen_policy(['password']) as server:
+            async with self._connect_policy(server, username='ckey',
+                                            password='pw'):
+                pass
+
+    @asynctest
+    async def test_repeated_publickey_policy(self):
+        """Test auth policy requiring two different public keys"""
+
+        async with self._listen_policy(['publickey', 'publickey']) as server:
+            async with self._connect_policy(
+                    server, username='ckey',
+                    client_keys=['ckey_ecdsa', 'ckey']):
+                pass
+
+    @asynctest
+    async def test_reused_publickey(self):
+        """Test the same public key can't complete two auth factors"""
+
+        async with self._listen_policy(['publickey', 'publickey']) as server:
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self._connect_policy(
+                    server, username='ckey',
+                    client_keys=['ckey_ecdsa', 'ckey_ecdsa'])
+
+    @asynctest
+    async def test_username_change_resets_progress(self):
+        """Test changing usernames resets auth policy progress"""
+
+        with patch('asyncssh.connection.SSHClientConnection',
+                   _UsernameSwitchClientConnection):
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self.connect(username='ckey', client_keys='ckey',
+                                   password='pw', agent_path=None)
+
+    @asynctest
+    async def test_channel_open_before_auth_complete(self):
+        """Test session channel can't be opened before auth completes"""
+
+        with patch('asyncssh.connection.SSHClientConnection',
+                   _EarlyChannelClientConnection):
+            with self.assertRaises(asyncssh.DisconnectError):
+                await self.connect(username='ckey', client_keys='ckey',
+                                   password='pw', agent_path=None)
+
+    @asynctest
+    async def test_auth_cancel_cleans_up_state(self):
+        """Test auth policy state is cleaned up when auth is aborted"""
+
+        servers = []
+
+        def server_factory():
+            """Return an SSHServer to use, recording it for later use"""
+
+            server = _AuthPolicyServer()
+            servers.append(server)
+            return server
+
+        async with self._listen_policy(['publickey', 'password'],
+                                       server_factory=server_factory) \
+                as server:
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self._connect_policy(server, username='ckey',
+                                           client_keys='ckey')
+
+            await asyncio.sleep(0.1)
+
+        self.assertEqual(servers[0]._conn._auth_factors, [])
+        self.assertEqual(servers[0]._conn._auth_used_keys, set())
+
+    @asynctest
+    async def test_login_timeout_cleans_up_state(self):
+        """Test auth policy state is cleaned up on login timeout"""
+
+        servers = []
+
+        def server_factory():
+            """Return an SSHServer to use, recording it for later use"""
+
+            server = _AuthPolicyServer()
+            servers.append(server)
+            return server
+
+        async with self._listen_policy(['publickey', 'password'],
+                                       server_factory=server_factory,
+                                       login_timeout=1) as server:
+            def client_factory():
+                """Return an SSHClient which stalls after the first factor"""
+
+                return _StallPasswordClient()
+
+            with self.assertRaises(asyncssh.ConnectionLost):
+                async with self._connect_policy(
+                        server, client_factory=client_factory,
+                        username='ckey', client_keys='ckey'):
+                    pass
+
+            await asyncio.sleep(0.1)
+
+        self.assertEqual(servers[0]._conn._auth_factors, [])
+        self.assertEqual(servers[0]._conn._auth_used_keys, set())
+
+    @asynctest
+    async def test_invalid_auth_policy(self):
+        """Test validation of the auth policy option"""
+
+        for auth_policy in ([], [[]], ['none'], ['unknown'],
+                            [['publickey', 'unknown']]):
+            with self.assertRaises(ValueError):
+                asyncssh.SSHServerConnectionOptions(auth_policy=auth_policy)

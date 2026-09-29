@@ -633,6 +633,48 @@ def _validate_version(version: DefTuple[BytesOrStr]) -> bytes:
     return version
 
 
+def _validate_auth_policy(auth_policy: Optional[Sequence[Union[
+        BytesOrStr, Sequence[BytesOrStr]]]]) -> \
+        Optional[Tuple[Tuple[bytes, ...], ...]]:
+    """Validate a server authentication policy
+
+       The policy is a sequence of stages which must be completed in
+       order. Each stage is either a single auth method name or a
+       sequence of method names, any one of which can satisfy that
+       stage. Method names are normalized to bytes and validated
+       against the set of supported authentication methods.
+
+    """
+
+    if auth_policy is None:
+        return None
+
+    supported_methods = set(get_supported_client_auth_methods())
+    stages = []
+
+    for stage in auth_policy:
+        if isinstance(stage, (str, bytes)):
+            stage = (stage,)
+
+        methods = tuple(method.encode('ascii') if isinstance(method, str)
+                        else method for method in stage)
+
+        if not methods:
+            raise ValueError('Auth policy stage cannot be empty')
+
+        for method in methods:
+            if method not in supported_methods:
+                raise ValueError('Unknown auth method in policy: '
+                                 f'{method.decode("ascii", errors="replace")}')
+
+        stages.append(methods)
+
+    if not stages:
+        raise ValueError('Auth policy cannot be empty')
+
+    return tuple(stages)
+
+
 def _expand_algs(alg_type: str, algs: str,
                  possible_algs: List[bytes],
                  default_algs: List[bytes],
@@ -1011,6 +1053,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._auth_final = False
         self._auth_methods = [b'none']
         self._auth_was_trivial = True
+        self._auth_policy: Optional[Tuple[Tuple[bytes, ...], ...]] = None
+        self._auth_factors: List[bytes] = []
+        self._auth_used_keys: Set[bytes] = set()
         self._username = ''
 
         self._channels: Dict[int, SSHChannel] = {}
@@ -1100,6 +1145,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         if self._auth:
             self._auth.cancel()
             self._auth = None
+
+        self._auth_factors = []
+        self._auth_used_keys = set()
 
         if self._error_handler:
             self._error_handler(self, exc)
@@ -2103,14 +2151,91 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
     def send_userauth_failure(self, partial_success: bool) -> None:
         """Send a user authentication failure response"""
 
-        methods = get_supported_server_auth_methods(
-            cast(SSHServerConnection, self))
+        methods = self.get_allowed_auth_methods()
 
         self.logger.debug2('Remaining auth methods: %s', methods or 'None')
 
         self._auth = None
         self.send_packet(MSG_USERAUTH_FAILURE, NameList(methods),
                          Boolean(partial_success))
+
+    def get_allowed_auth_methods(self) -> Sequence[bytes]:
+        """Return the auth methods currently allowed on this connection
+
+           When a server authentication policy is configured, only the
+           methods allowed in the current incomplete policy stage are
+           returned. Otherwise, all supported server auth methods are
+           returned.
+
+        """
+
+        methods = get_supported_server_auth_methods(
+            cast(SSHServerConnection, self))
+
+        if self._auth_policy is not None:
+            stage = self._get_auth_policy_stage()
+
+            if stage < len(self._auth_policy):
+                allowed = self._auth_policy[stage]
+                methods = [method for method in methods
+                           if method in allowed]
+            else:
+                methods = []
+
+        return methods
+
+    def _get_auth_policy_stage(self) -> int:
+        """Return the current stage of the server auth policy
+
+           Completed auth factors are matched against the configured
+           policy stages in order, with each factor satisfying at most
+           one stage.
+
+        """
+
+        stage = 0
+
+        if self._auth_policy is not None:
+            for method in self._auth_factors:
+                if stage < len(self._auth_policy) and \
+                        method in self._auth_policy[stage]:
+                    stage += 1
+
+        return stage
+
+    async def auth_factor_succeeded(self, method: bytes) -> None:
+        """Handle successful completion of an authentication factor
+
+           The completed factor is recorded and matched against the
+           configured server auth policy. If the policy (if any) is
+           fully satisfied, authentication completes. Otherwise, a
+           partial success response is sent advertising only the
+           methods allowed in the next policy stage.
+
+        """
+
+        self._auth_factors.append(method)
+
+        if self._auth_policy is None or \
+                self._get_auth_policy_stage() >= len(self._auth_policy):
+            await self.send_userauth_success()
+        else:
+            self.logger.debug1('Auth method %s succeeded for user %s, but '
+                               'additional auth factors are required',
+                               method.decode('ascii', errors='replace'),
+                               self._username)
+
+            self.send_userauth_failure(partial_success=True)
+
+    def auth_key_reused(self, key_data: bytes) -> bool:
+        """Return whether a key already completed an auth factor"""
+
+        return key_data in self._auth_used_keys
+
+    def record_auth_key(self, key_data: bytes) -> None:
+        """Record a key as having completed an auth factor"""
+
+        self._auth_used_keys.add(key_data)
 
     async def send_userauth_success(self) -> None:
         """Send a user authentication success response"""
@@ -2541,6 +2666,8 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
                 self.logger.info('Beginning auth for user %s', username)
 
                 self._username = username
+                self._auth_factors = []
+                self._auth_used_keys = set()
                 begin_auth = True
             else:
                 begin_auth = False
@@ -2615,8 +2742,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         if self.is_client() and self._auth:
             auth = cast(ClientAuth, self._auth)
 
-            if partial_success: # pragma: no cover
-                # Partial success not implemented yet
+            if partial_success:
+                # The last auth method succeeded, but the server requires
+                # additional authentication factors
                 auth.auth_succeeded()
             else:
                 auth.auth_failed()
@@ -5885,6 +6013,7 @@ class SSHServerConnection(SSHConnection):
         self._known_client_hosts = options.known_client_hosts
         self._trust_client_host = options.trust_client_host
         self._authorized_client_keys = options.authorized_client_keys
+        self._auth_policy = options.auth_policy
         self._allow_pty = options.allow_pty
         self._line_editor = options.line_editor
         self._line_echo = options.line_echo
@@ -5964,6 +6093,7 @@ class SSHServerConnection(SSHConnection):
         self._password_auth = options.password_auth
 
         self._authorized_client_keys = options.authorized_client_keys
+        self._auth_policy = options.auth_policy
         self._allow_pty = options.allow_pty
         self._x11_forwarding = options.x11_forwarding
         self._agent_forwarding = options.agent_forwarding
@@ -8050,12 +8180,12 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
        :type client_keys: *see* :ref:`SpecifyingPrivateKeys`
        :type client_certs: *see* :ref:`SpecifyingCertificates`
        :type passphrase: `str` or `bytes`
-       :type ignore_encrypted: `bool`
-       :type host_based_auth: `bool`
-       :type public_key_auth: `bool`
-       :type kbdint_auth: `bool`
-       :type password_auth: `bool`
-       :type gss_host: `str`
+      :type ignore_encrypted: `bool`
+     :type host_based_auth: `bool`
+     :type public_key_auth: `bool`
+     :type kbdint_auth: `bool`
+     :type password_auth: `bool`
+     :type gss_host: `str`
        :type gss_store:
            `str`, `bytes`, or a `dict` with `str` or `bytes` keys and values
        :type gss_kex: `bool`
@@ -8591,6 +8721,16 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
            Whether or not to allow password authentication. By default,
            password authentication is enabled if callbacks to validate a
            password are made available.
+       :param auth_policy: (optional)
+           A multi-factor authentication policy, specified as a sequence
+           of stages which must be completed in order for authentication
+           to succeed. Each stage is either the name of an authentication
+           method or a sequence of method names, any one of which can
+           satisfy that stage. After each stage is completed, a partial
+           success response is sent to the client advertising only the
+           methods allowed in the next stage. The same public key cannot
+           be used to satisfy more than one stage. By default, no policy
+           is set and any single completed auth method is sufficient.
        :param gss_host: (optional)
            The principal name to use for the host in GSS key exchange and
            authentication. If not specified, the value returned by
@@ -8804,6 +8944,7 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
        :type public_key_auth: `bool`
        :type kbdint_auth: `bool`
        :type password_auth: `bool`
+       :type auth_policy: `list` of `str` or `list` of `list` of `str`
        :type gss_host: `str`
        :type gss_store:
            `str`, `bytes`, or a `dict` with `str` or `bytes` keys and values
@@ -8860,6 +9001,7 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
     known_client_hosts: KnownHostsArg
     trust_client_host: bool
     authorized_client_keys: DefTuple[Optional[SSHAuthorizedKeys]]
+    auth_policy: Optional[Tuple[Tuple[bytes, ...], ...]]
     gss_host: Optional[str]
     gss_store: Optional[Dict[BytesOrStr, BytesOrStr]]
     gss_kex: bool
@@ -8926,6 +9068,8 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                 known_client_hosts: KnownHostsArg = None,
                 trust_client_host: bool = False,
                 authorized_client_keys: _AuthKeysArg = (),
+                auth_policy: Optional[Sequence[Union[
+                    BytesOrStr, Sequence[BytesOrStr]]]] = None,
                 gss_host: DefTuple[Optional[str]] = (),
                 gss_store: Optional[Union[BytesOrStr, BytesOrStrDict]] = None,
                 gss_kex: DefTuple[bool] = (),
@@ -9025,6 +9169,8 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                 read_authorized_keys(authorized_client_keys)
         else:
             self.authorized_client_keys = authorized_client_keys
+
+        self.auth_policy = _validate_auth_policy(auth_policy)
 
         if gss_host == ():
             gss_host = socket.gethostname()

@@ -284,6 +284,7 @@ class _AuthServerStub(_AuthConnectionStub):
         self._success = success
 
         self._auth = None
+        self._auth_used_keys = set()
 
     @property
     def auth(self):
@@ -343,6 +344,21 @@ class _AuthServerStub(_AuthConnectionStub):
 
         self._auth = None
         self.send_userauth_packet(MSG_USERAUTH_SUCCESS)
+
+    async def auth_factor_succeeded(self, _method):
+        """Handle successful completion of an authentication factor"""
+
+        await self.send_userauth_success()
+
+    def auth_key_reused(self, key_data):
+        """Return whether a key already completed an auth factor"""
+
+        return key_data in self._auth_used_keys
+
+    def record_auth_key(self, key_data):
+        """Record a key as having completed an auth factor"""
+
+        self._auth_used_keys.add(key_data)
 
     def get_gss_context(self):
         """Return the GSS context associated with this connection"""
