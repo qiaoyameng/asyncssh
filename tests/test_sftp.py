@@ -38,6 +38,7 @@ import asyncssh
 from asyncssh import SFTPError, SFTPNoSuchFile, SFTPPermissionDenied
 from asyncssh import SFTPFailure, SFTPBadMessage, SFTPNoConnection
 from asyncssh import SFTPConnectionLost, SFTPOpUnsupported, SFTPInvalidHandle
+from asyncssh import SFTPCopyRangesError
 from asyncssh import SFTPNoSuchPath, SFTPFileAlreadyExists, SFTPWriteProtect
 from asyncssh import SFTPNoMedia, SFTPNoSpaceOnFilesystem, SFTPQuotaExceeded
 from asyncssh import SFTPUnknownPrincipal, SFTPLockConflict, SFTPDirNotEmpty
@@ -319,6 +320,18 @@ class _SmallBlockSizeSFTPServer(SFTPServer):
         """Limit reads to return no more than 4 KB at a time"""
 
         return super().read(file_obj, offset, min(size, 4096))
+
+
+class _CopyRangesErrorSFTPServer(SFTPServer):
+    """Return an I/O error when writing at or past 1 MB in a file"""
+
+    async def write(self, file_obj, offset, data):
+        """Return an error for writes at or past 1 MB in a file"""
+
+        if offset >= 1024*1024:
+            raise SFTPFailure('I/O error')
+        else:
+            super().write(file_obj, offset, data)
 
 
 class _TruncateSFTPServer(SFTPServer):
@@ -1361,6 +1374,155 @@ class _TestSFTP(_CheckSFTP):
                     await sftp.remote_copy(f, f)
         finally:
             remove('file')
+
+    @sftp_test
+    async def test_copy_ranges(self, sftp):
+        """Test copying multiple ranges between remote files"""
+
+        try:
+            # Create a sparse source file with data at 0 and 1 MB
+            self._create_file('src', os.urandom(64*1024),
+                              offsets=(0, 1024*1024))
+
+            with open('src', 'rb') as f:
+                src_data = f.read()
+
+            src_size = len(src_data)
+
+            ranges = [(0, 0, 64*1024),
+                      (1024*1024, 512*1024, 64*1024),
+                      (32*1024, 2*1024*1024, 2*1024*1024),
+                      (src_size + 1024*1024, 4*1024*1024, 4096)]
+
+            bytes_copied = await sftp.copy_ranges('src', 'dst', ranges)
+
+            # The third range extends past EOF and the fourth begins
+            # past EOF, so both copy fewer bytes than requested
+            self.assertEqual(bytes_copied,
+                             [64*1024, 64*1024, src_size - 32*1024, 0])
+
+            expected = bytearray(2*1024*1024 + src_size - 32*1024)
+            expected[0:64*1024] = src_data[0:64*1024]
+            expected[512*1024:512*1024+64*1024] = \
+                src_data[1024*1024:1024*1024+64*1024]
+            expected[2*1024*1024:] = src_data[32*1024:]
+
+            with open('dst', 'rb') as f:
+                self.assertEqual(f.read(), bytes(expected))
+        finally:
+            remove('src dst')
+
+    @sftp_test
+    async def test_copy_ranges_same_file(self, sftp):
+        """Test copying overlapping ranges within a single remote file"""
+
+        try:
+            data = bytes(range(256))
+            self._create_file('src', data)
+
+            # Both ranges are interpreted against the file's contents
+            # prior to the call, even though the first range overwrites
+            # data read by the second
+            bytes_copied = await sftp.copy_ranges(
+                'src', 'src', [(0, 128, 128), (128, 192, 64)])
+
+            self.assertEqual(bytes_copied, [128, 64])
+
+            with open('src', 'rb') as f:
+                self.assertEqual(f.read(),
+                                 data[0:128] + data[0:64] + data[128:192])
+        finally:
+            remove('src')
+
+    @sftp_test
+    async def test_copy_ranges_open_file(self, sftp):
+        """Test copying ranges within a single open remote file"""
+
+        try:
+            data = bytes(range(256))
+            self._create_file('src', data)
+
+            async with sftp.open('src', 'r+') as f:
+                bytes_copied = await sftp.copy_ranges(
+                    f, f, [(0, 128, 128), (128, 192, 64)])
+
+            self.assertEqual(bytes_copied, [128, 64])
+
+            with open('src', 'rb') as f:
+                self.assertEqual(f.read(),
+                                 data[0:128] + data[0:64] + data[128:192])
+        finally:
+            remove('src')
+
+    def test_copy_ranges_fallback(self):
+        """Test copying ranges without the copy-ranges extension"""
+
+        @sftp_test
+        async def _test_copy_ranges_fallback(self, sftp):
+            """Test falling back to copy-data when copying ranges"""
+
+            try:
+                self._create_file('src', os.urandom(64*1024),
+                                  offsets=(0, 1024*1024))
+
+                with open('src', 'rb') as f:
+                    src_data = f.read()
+
+                bytes_copied = await sftp.copy_ranges(
+                    'src', 'dst', [(0, 0, 64*1024),
+                                   (1024*1024, 512*1024, 64*1024)])
+
+                self.assertEqual(bytes_copied, [64*1024, 64*1024])
+
+                expected = bytearray(512*1024 + 64*1024)
+                expected[0:64*1024] = src_data[0:64*1024]
+                expected[512*1024:] = src_data[1024*1024:]
+
+                with open('dst', 'rb') as f:
+                    self.assertEqual(f.read(), bytes(expected))
+            finally:
+                remove('src dst')
+
+        extensions = [ext for ext in SFTPServerHandler._extensions
+                      if ext[0] != b'copy-ranges@asyncssh.com']
+
+        with patch('asyncssh.sftp.SFTPServerHandler._extensions', extensions):
+            # pylint: disable=no-value-for-parameter
+            _test_copy_ranges_fallback(self)
+
+    def test_copy_ranges_unsupported(self):
+        """Test copying ranges when no remote copy extension exists"""
+
+        @sftp_test
+        async def _test_copy_ranges_unsupported(self, sftp):
+            """Test copy_ranges not being supported"""
+
+            try:
+                self._create_file('src')
+
+                with self.assertRaises(SFTPOpUnsupported):
+                    await sftp.copy_ranges('src', 'dst', [(0, 0, 1)])
+            finally:
+                remove('src dst')
+
+        with patch('asyncssh.sftp.SFTPServerHandler._extensions', []):
+            # pylint: disable=no-value-for-parameter
+            _test_copy_ranges_unsupported(self)
+
+    @sftp_test
+    async def test_copy_ranges_invalid(self, sftp):
+        """Test copying ranges with invalid arguments"""
+
+        try:
+            self._create_file('src')
+
+            with self.assertRaises(ValueError):
+                await sftp.copy_ranges('src', 'dst', [(0, -1, 1)])
+
+            with self.assertRaises(ValueError):
+                await sftp.copy_ranges('src', 'dst', [(0, 0, -1)])
+        finally:
+            remove('src dst')
 
     @sftp_test
     async def test_oversized_sftp_write(self, sftp):
@@ -4685,6 +4847,45 @@ class _TestSFTPOpenError(_CheckSFTP):
 
         with self.assertRaises(SFTPFailure):
             await sftp.open('ENXIO')
+
+
+class _TestSFTPCopyRangesError(_CheckSFTP):
+    """Unit test for SFTP copy ranges request failing partway through"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SFTP server which fails writes at or past 1 MB"""
+
+        return await cls.create_server(sftp_factory=_CopyRangesErrorSFTPServer)
+
+    @sftp_test
+    async def test_copy_ranges_error(self, sftp):
+        """Test error partway through a copy ranges request"""
+
+        try:
+            self._create_file('src', os.urandom(4096),
+                              offsets=(0, 1024*1024, 2*1024*1024))
+
+            with open('src', 'rb') as f:
+                src_data = f.read()
+
+            ranges = [(0, 0, 4096),
+                      (1024*1024, 1024*1024, 4096),
+                      (2*1024*1024, 2*1024*1024, 4096)]
+
+            with self.assertRaises(SFTPCopyRangesError) as cm:
+                await sftp.copy_ranges('src', 'dst', ranges)
+
+            # Only the first range completed before the failure
+            self.assertEqual(cm.exception.completed, 1)
+            self.assertEqual(cm.exception.bytes_copied, [4096, 0, 0])
+
+            # The first range remains visible in the destination,
+            # while the failed and later ranges were never applied
+            with open('dst', 'rb') as f:
+                self.assertEqual(f.read(), src_data[0:4096])
+        finally:
+            remove('src dst')
 
 
 class _TestSFTPIOError(_CheckSFTP):

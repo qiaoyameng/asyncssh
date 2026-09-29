@@ -1100,6 +1100,43 @@ class SFTPFailure(SFTPError):
         super().__init__(FX_FAILURE, reason, lang)
 
 
+class SFTPCopyRangesError(SFTPError):
+    """SFTP copy ranges error
+
+       This exception is raised when a :meth:`SFTPClient.copy_ranges`
+       request fails partway through. Since the requested range copies
+       are not performed atomically, ranges prior to the one which
+       failed may have already been applied. The number of ranges which
+       completed successfully is available in :attr:`completed`, and
+       the number of bytes copied for each requested range (0 for
+       ranges which didn't complete) is available in
+       :attr:`bytes_copied`.
+
+       :param code:
+           The SFTP error code associated with the failure
+       :param reason:
+           A human-readable reason for the failure
+       :param completed:
+           The number of ranges which completed before the failure
+       :param bytes_copied:
+           The number of bytes copied for each requested range
+       :param lang: (optional)
+           The language the reason is in
+       :type code: `int`
+       :type reason: `str`
+       :type completed: `int`
+       :type bytes_copied: `list` of `int`
+       :type lang: `str`
+
+    """
+
+    def __init__(self, code: int, reason: str, completed: int,
+                 bytes_copied: Sequence[int], lang: str = DEFAULT_LANG):
+        super().__init__(code, reason, lang)
+        self.completed = completed
+        self.bytes_copied = list(bytes_copied)
+
+
 class SFTPBadMessage(SFTPError):
     """SFTP bad message
 
@@ -2250,6 +2287,53 @@ class SFTPRanges(Record):
             logger.debug1('  offset %d, length %d', offset, length)
 
 
+class SFTPCopyRangesResult(Record):
+    """SFTP copy ranges result"""
+
+    bytes_copied: List[int]
+    failed_range: Optional[int]
+    error_code: int
+    error_message: str
+
+    def encode(self) -> bytes:
+        """Encode a copy ranges result in an SSH packet"""
+
+        failed_range = self.failed_range
+
+        return (UInt32(len(self.bytes_copied)) +
+                b''.join(UInt64(copied) for copied in self.bytes_copied) +
+                UInt32(0xffffffff if failed_range is None else failed_range) +
+                UInt32(self.error_code) + String(self.error_message))
+
+    @classmethod
+    def decode(cls, packet: SSHPacket) -> Self:
+        """Decode bytes in an SSH packet as a copy ranges result"""
+
+        count = packet.get_uint32()
+        bytes_copied = [packet.get_uint64() for _ in range(count)]
+        failed_range = packet.get_uint32()
+        error_code = packet.get_uint32()
+        error_message = packet.get_string().decode('utf-8', 'replace')
+
+        return cls(bytes_copied,
+                   None if failed_range == 0xffffffff else failed_range,
+                   error_code, error_message)
+
+    def log(self, logger: SSHLogger, label: str) -> None:
+        """Log sending or receiving a copy ranges result"""
+
+        logger.debug1('%s %s', label,
+                      plural(len(self.bytes_copied), 'copied range'))
+
+        for idx, copied in enumerate(self.bytes_copied):
+            if idx == self.failed_range:
+                logger.debug1('  range %d: %s, error %d (%s)', idx,
+                              plural(copied, 'byte'), self.error_code,
+                              self.error_message)
+            else:
+                logger.debug1('  range %d: %s', idx, plural(copied, 'byte'))
+
+
 class SFTPGlob:
     """SFTP glob matcher"""
 
@@ -2465,7 +2549,8 @@ class SFTPHandler(SSHPacketLogger):
         b'statvfs@openssh.com':   FXP_EXTENDED_REPLY,
         b'fstatvfs@openssh.com':  FXP_EXTENDED_REPLY,
         b'limits@openssh.com':    FXP_EXTENDED_REPLY,
-        b'ranges@asyncssh.com':   FXP_EXTENDED_REPLY
+        b'ranges@asyncssh.com':   FXP_EXTENDED_REPLY,
+        b'copy-ranges@asyncssh.com': FXP_EXTENDED_REPLY
     }
 
     def __init__(self, reader: 'SSHReader[bytes]', writer: 'SSHWriter[bytes]'):
@@ -2634,6 +2719,7 @@ class SFTPClientHandler(SFTPHandler):
         self._supports_limits = False
         self._supports_copy_data = False
         self._supports_ranges = False
+        self._supports_copy_ranges = False
 
     @property
     def version(self) -> int:
@@ -2646,6 +2732,12 @@ class SFTPClientHandler(SFTPHandler):
         """Return whether or not SFTP remote copy is supported"""
 
         return self._supports_copy_data
+
+    @property
+    def supports_copy_ranges(self) -> bool:
+        """Return whether or not SFTP remote range copy is supported"""
+
+        return self._supports_copy_ranges
 
     async def _cleanup(self, exc: Optional[Exception]) -> None:
         """Clean up this SFTP client session"""
@@ -2864,6 +2956,8 @@ class SFTPClientHandler(SFTPHandler):
                 self._supports_copy_data = True
             elif name == b'ranges@asyncssh.com' and data == b'1':
                 self._supports_ranges = True
+            elif name == b'copy-ranges@asyncssh.com' and data == b'1':
+                self._supports_copy_ranges = True
 
         if version == 3:
             # Check if the server has a buggy SYMLINK implementation
@@ -3280,6 +3374,86 @@ class SFTPClientHandler(SFTPHandler):
                                      UInt64(write_to_offset))
         else:
             raise SFTPOpUnsupported('copy-data not supported')
+
+    async def copy_ranges(self, read_from_handle: bytes,
+                          write_to_handle: bytes,
+                          ranges: Sequence[Tuple[int, int, int]]) -> List[int]:
+        """Make an SFTP copy ranges request
+
+           Each range is a tuple of a read offset, write offset, and
+           length. A length of 0 copies data through the end of the
+           source file.
+
+           When the server doesn't support the copy-ranges extension,
+           this falls back to making a sequence of copy-data requests,
+           one per range. In that case, ranges are applied in order
+           against the current file contents, so overlapping ranges
+           within the same file are not interpreted against a snapshot
+           of the data from before the call.
+
+           The range copies are not performed atomically. On failure,
+           an SFTPCopyRangesError is raised reporting how many ranges
+           completed and how many bytes were copied for each range.
+
+        """
+
+        for read_offset, write_offset, length in ranges:
+            if read_offset < 0 or write_offset < 0 or length < 0:
+                raise ValueError('copy_ranges offsets and lengths must be '
+                                 'non-negative')
+
+        if not ranges:
+            return []
+
+        if self._supports_copy_ranges:
+            self.logger.debug1('Sending copy-ranges from handle %s to '
+                               'handle %s, %s', read_from_handle.hex(),
+                               write_to_handle.hex(),
+                               plural(len(ranges), 'range'))
+
+            packet = cast(SSHPacket, await self._make_request(
+                b'copy-ranges@asyncssh.com',
+                String(read_from_handle), String(write_to_handle),
+                UInt32(len(ranges)),
+                *(UInt64(read_offset) + UInt64(write_offset) + UInt64(length)
+                  for read_offset, write_offset, length in ranges)))
+
+            result = SFTPCopyRangesResult.decode(packet)
+            packet.check_end()
+
+            result.log(self.logger, 'Received')
+
+            if result.failed_range is not None:
+                raise SFTPCopyRangesError(result.error_code,
+                                          result.error_message,
+                                          result.failed_range,
+                                          result.bytes_copied)
+
+            return result.bytes_copied
+        elif self._supports_copy_data:
+            self.logger.debug1('Falling back to copy-data for %s',
+                               plural(len(ranges), 'range'))
+
+            completed = 0
+
+            for read_offset, write_offset, length in ranges:
+                try:
+                    await self.copy_data(read_from_handle, read_offset,
+                                         length, write_to_handle,
+                                         write_offset)
+                except SFTPError as exc:
+                    bytes_copied = [length for _, _, length in ranges]
+                    bytes_copied[completed:] = (len(ranges) - completed) * [0]
+
+                    raise SFTPCopyRangesError(exc.code, exc.reason,
+                                              completed, bytes_copied,
+                                              exc.lang) from exc
+
+                completed += 1
+
+            return [length for _, _, length in ranges]
+        else:
+            raise SFTPOpUnsupported('copy-ranges not supported')
 
     async def request_ranges(self, handle: bytes, offset: int,
                              length: int) -> SFTPRanges:
@@ -4591,6 +4765,90 @@ class SFTPClient:
 
         await self._handler.copy_data(src.handle, src_offset, src_length,
                                       dst.handle, dst_offset)
+
+    async def copy_ranges(self, src: _SFTPClientFileOrPath,
+                          dst: _SFTPClientFileOrPath,
+                          ranges: Sequence[Tuple[int, int, int]]) -> List[int]:
+        """Copy multiple byte ranges between remote files
+
+           This method copies a set of byte ranges from a source file
+           to a target file without the data ever leaving the remote
+           system. Each range is a tuple of a source offset, target
+           offset, and length. A length of 0 copies data through the
+           end of the source file.
+
+           If the target is a path which doesn't exist, it is created.
+           An existing target file is not truncated, so data outside
+           of the copied ranges is left unchanged.
+
+           When the source and target refer to the same file, a single
+           open handle is shared for reading and writing and all source
+           data is read before any of it is written back, so
+           overlapping ranges are interpreted against the file's
+           contents as they were before this call. To get this behavior
+           with an explicitly opened file, open it for both reading and
+           writing and pass the same :class:`SFTPClientFile` as both
+           the source and target.
+
+           If the server doesn't support the copy-ranges extension,
+           this method falls back to making a sequence of copy-data
+           requests, one per range. In this mode, each range is
+           interpreted against the file contents left behind by the
+           previous ranges, so the snapshot behavior described above
+           is not guaranteed for overlapping ranges. If the server
+           supports neither extension, :exc:`SFTPOpUnsupported` is
+           raised.
+
+           The requested range copies are not performed atomically.
+           If a copy fails partway through, ranges which already
+           completed remain applied and an :exc:`SFTPCopyRangesError`
+           is raised reporting how many ranges completed and how many
+           bytes were copied for each requested range.
+
+           A short source file is not treated as an error. The number
+           of bytes actually copied for each range is returned, which
+           may be less than the requested length (or even 0) for ranges
+           which extend beyond the end of the source file.
+
+           :param src:
+               The remote file object or path to read data from
+           :param dst:
+               The remote file object or path to write data to
+           :param ranges:
+               A sequence of (source offset, target offset, length)
+               tuples describing the ranges to copy
+           :type src:
+               :class:`SFTPClientFile`, :class:`PurePath <pathlib.PurePath>`,
+               `str`, or `bytes`
+           :type dst:
+               :class:`SFTPClientFile`, :class:`PurePath <pathlib.PurePath>`,
+               `str`, or `bytes`
+           :type ranges: sequence of 3-`tuple` of `int`
+
+           :returns: a list of the number of bytes copied for each range
+
+           :raises: | :exc:`SFTPCopyRangesError` if a range copy fails
+                      partway through
+                    | :exc:`SFTPOpUnsupported` if the server supports
+                      neither the copy-ranges nor copy-data extension
+                    | :exc:`SFTPError` if the server returns another error
+
+        """
+
+        if isinstance(src, (bytes, str, PurePath)):
+            if (isinstance(dst, (bytes, str, PurePath)) and
+                    self.encode(src) == self.encode(dst)):
+                # Open a single read/write handle, so that overlapping
+                # ranges are interpreted against the file's original
+                # contents
+                src = dst = await self.open(src, 'r+b', block_size=0)
+            else:
+                src = await self.open(src, 'rb', block_size=0)
+
+        if isinstance(dst, (bytes, str, PurePath)):
+            dst = await self.open(dst, FXF_WRITE | FXF_CREAT, block_size=0)
+
+        return await self._handler.copy_ranges(src.handle, dst.handle, ranges)
 
     async def glob(self, patterns: _SFTPPaths,
                    error_handler: SFTPErrorHandler = None) -> \
@@ -5961,7 +6219,8 @@ class SFTPServerHandler(SFTPHandler):
         (b'lsetstat@openssh.com', b'1'),
         (b'limits@openssh.com', b'1'),
         (b'copy-data', b'1'),
-        (b'ranges@asyncssh.com', b'1')]
+        (b'ranges@asyncssh.com', b'1'),
+        (b'copy-ranges@asyncssh.com', b'1')]
 
     _attrib_extensions: List[bytes] = []
 
@@ -6069,6 +6328,9 @@ class SFTPServerHandler(SFTPHandler):
                 result.log(self.logger, 'Sending')
                 response = result.encode()
             elif isinstance(result, SFTPRanges):
+                result.log(self.logger, 'Sending')
+                response = result.encode()
+            elif isinstance(result, SFTPCopyRangesResult):
                 result.log(self.logger, 'Sending')
                 response = result.encode()
             else:
@@ -6854,6 +7116,116 @@ class SFTPServerHandler(SFTPHandler):
         else:
             raise SFTPInvalidHandle('Invalid file handle')
 
+    async def _read_copy_blocks(self, file_obj: object, offset: int,
+                                length: int) -> AsyncIterator[bytes]:
+        """Yield blocks of data to copy from an open file"""
+
+        read_to_end = length == 0
+
+        while read_to_end or length:
+            size = _COPY_DATA_BLOCK_SIZE if read_to_end else \
+                min(length, _COPY_DATA_BLOCK_SIZE)
+
+            data = self._server.read(file_obj, offset, size)
+
+            if inspect.isawaitable(data):
+                data = await data
+
+            if not data:
+                break
+
+            yield data
+
+            offset += len(data)
+
+            if not read_to_end:
+                length -= len(data)
+
+            if len(data) < size:
+                break
+
+    async def _write_copy_block(self, file_obj: object, offset: int,
+                                data: bytes) -> None:
+        """Write a block of copied data to an open file"""
+
+        result = self._server.write(file_obj, offset, data)
+
+        if inspect.isawaitable(result):
+            await result
+
+    async def _process_copy_ranges(self, packet: SSHPacket) -> \
+            SFTPCopyRangesResult:
+        """Process an incoming copy ranges request"""
+
+        read_from_handle = packet.get_string()
+        write_to_handle = packet.get_string()
+        count = packet.get_uint32()
+        ranges = [(packet.get_uint64(), packet.get_uint64(),
+                   packet.get_uint64()) for _ in range(count)]
+        packet.check_end()
+
+        self.logger.debug1('Received copy-ranges from handle %s to '
+                           'handle %s, %s', read_from_handle.hex(),
+                           write_to_handle.hex(),
+                           plural(len(ranges), 'range'))
+
+        for read_offset, write_offset, length in ranges:
+            self.logger.debug1('  offset %d to offset %d, length %d',
+                               read_offset, write_offset, length)
+
+        src = self._file_handles.get(read_from_handle)
+        dst = self._file_handles.get(write_to_handle)
+
+        if not (src and dst):
+            raise SFTPInvalidHandle('Invalid file handle')
+
+        bytes_copied = [0] * count
+        failed_range: Optional[int] = None
+
+        try:
+            if read_from_handle == write_to_handle:
+                # Read all of the source data before performing any
+                # writes, so overlapping ranges within the file are
+                # interpreted against its contents prior to this
+                # request
+                buffered = []
+
+                for idx, (read_offset, _, length) in enumerate(ranges):
+                    failed_range = idx
+                    buffered.append(b''.join([data async for data in
+                                              self._read_copy_blocks(
+                                                  src, read_offset, length)]))
+
+                for idx, ((_, write_offset, _), data) in \
+                        enumerate(zip(ranges, buffered)):
+                    failed_range = idx
+                    await self._write_copy_block(dst, write_offset, data)
+                    bytes_copied[idx] = len(data)
+            else:
+                for idx, (read_offset, write_offset, length) in \
+                        enumerate(ranges):
+                    failed_range = idx
+
+                    async for data in self._read_copy_blocks(src, read_offset,
+                                                             length):
+                        await self._write_copy_block(dst, write_offset, data)
+                        bytes_copied[idx] += len(data)
+                        write_offset += len(data)
+
+            failed_range = None
+        except SFTPError as exc:
+            error_code = exc.code
+            error_message = exc.reason
+        except OSError as exc:
+            error_code = FX_FAILURE
+            error_message = exc.strerror or str(exc)
+        else:
+            error_code = FX_OK
+            error_message = ''
+
+        return SFTPCopyRangesResult(bytes_copied, failed_range,
+                                    error_code, error_message)
+
     async def _process_ranges(self, packet: SSHPacket) -> SFTPRanges:
         """Process an incoming sparse file ranges request"""
 
@@ -6916,7 +7288,8 @@ class SFTPServerHandler(SFTPHandler):
         b'lsetstat@openssh.com':      _process_lsetstat,
         b'limits@openssh.com':        _process_limits,
         b'copy-data':                 _process_copy_data,
-        b'ranges@asyncssh.com':       _process_ranges
+        b'ranges@asyncssh.com':       _process_ranges,
+        b'copy-ranges@asyncssh.com':  _process_copy_ranges
     }
 
     async def run(self) -> None:

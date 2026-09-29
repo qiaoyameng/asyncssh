@@ -1089,6 +1089,7 @@ SFTP Support
    .. automethod:: mput
    .. automethod:: mcopy
    .. automethod:: remote_copy
+   .. automethod:: copy_ranges
    =========================== =
 
    ============================================================================================================================================================================================================================== =
@@ -2041,6 +2042,7 @@ Exceptions
 .. autoexception:: SFTPNoConnection
 .. autoexception:: SFTPConnectionLost
 .. autoexception:: SFTPOpUnsupported
+.. autoexception:: SFTPCopyRangesError
 .. autoexception:: SFTPInvalidHandle
 .. autoexception:: SFTPNoSuchPath
 .. autoexception:: SFTPFileAlreadyExists
