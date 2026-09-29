@@ -20,7 +20,7 @@
 
 """SSH authentication handlers"""
 
-from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional
+from typing import TYPE_CHECKING, Awaitable, Dict, FrozenSet, List, Optional
 from typing import Sequence, Tuple, Type, Union, cast
 
 from .constants import DEFAULT_LANG
@@ -47,6 +47,14 @@ KbdIntChallenge = Union[bool, KbdIntNewChallenge]
 KbdIntResponse = Sequence[str]
 
 PasswordChangeResponse = Tuple[str, str]
+
+# An authentication policy, provided as a sequence of stages which must
+# each be completed in order. Each stage can be a single method name or
+# a sequence of method names, any one of which can satisfy that stage.
+AuthPolicyArg = Optional[Sequence[Union[str, bytes,
+                                        Sequence[Union[str, bytes]]]]]
+
+AuthPolicy = Tuple[FrozenSet[bytes], ...]
 
 
 # SSH message values for GSS auth
@@ -534,6 +542,7 @@ class ServerAuth(Auth):
                  method: bytes, packet: SSHPacket):
         self._username = username
         self._method = method
+        self._factor_id: Optional[bytes] = None
 
         super().__init__(conn, self._start(packet))
 
@@ -566,7 +575,8 @@ class ServerAuth(Auth):
         """Send a user authentication success response"""
 
         if self._conn.auth is self:
-            await self._conn.send_userauth_success()
+            await self._conn.auth_method_completed(self._method,
+                                                   self._factor_id)
 
 
 class _ServerNullAuth(ServerAuth):
@@ -758,6 +768,8 @@ class _ServerHostBasedAuth(ServerAuth):
 
         packet.check_end()
 
+        self._factor_id = key_data
+
         try:
             client_host = client_host_bytes.decode('utf-8')
             client_username = saslprep(client_username_bytes.decode('utf-8'))
@@ -803,6 +815,7 @@ class _ServerPublicKeyAuth(ServerAuth):
         packet.check_end()
 
         if sig_present:
+            self._factor_id = key_data
             self.logger.debug1('Verifying request with %s key', algorithm)
         else:
             self.logger.debug1('Trying public key auth with %s key', algorithm)
@@ -991,11 +1004,50 @@ def lookup_server_auth(conn: 'SSHServerConnection', username: str,
 
     handler = _server_auth_handlers.get(method)
 
-    if handler and handler.supported(conn):
+    if (handler and handler.supported(conn) and
+            conn.auth_method_allowed(method)):
         return handler(conn, username, method, packet)
     else:
-        conn.send_userauth_failure(False)
+        conn.send_userauth_failure(conn.auth_partial_success())
         return None
+
+
+def normalize_auth_policy(policy: AuthPolicyArg) -> AuthPolicy:
+    """Normalize an authentication policy into a tuple of stages
+
+       Each stage in the returned policy is a frozenset of authentication
+       method names, any one of which can satisfy that stage. All stages
+       must be completed in order for authentication to succeed.
+
+    """
+
+    if not policy:
+        return ()
+
+    stages = []
+
+    for stage in policy:
+        if isinstance(stage, (str, bytes)):
+            stage = (stage,)
+
+        methods = set()
+
+        for method in stage:
+            if isinstance(method, str):
+                method = method.encode('ascii')
+
+            if method == b'none' or method not in _server_auth_handlers:
+                raise ValueError('Unknown auth method in policy: '
+                                 f'{method!r}')
+
+            methods.add(method)
+
+        if not methods:
+            raise ValueError('Empty stage in auth policy')
+
+        stages.append(frozenset(methods))
+
+    return tuple(stages)
 
 
 _auth_method_list = (

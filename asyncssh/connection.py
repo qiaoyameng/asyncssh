@@ -46,6 +46,7 @@ from .agent import SSHAgentClient, SSHAgentListener
 
 from .auth import Auth, ClientAuth, KbdIntChallenge, KbdIntPrompts
 from .auth import KbdIntResponse, PasswordChangeResponse
+from .auth import AuthPolicy, AuthPolicyArg, normalize_auth_policy
 from .auth import get_supported_client_auth_methods, lookup_client_auth
 from .auth import get_supported_server_auth_methods, lookup_server_auth
 
@@ -2103,8 +2104,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
     def send_userauth_failure(self, partial_success: bool) -> None:
         """Send a user authentication failure response"""
 
-        methods = get_supported_server_auth_methods(
-            cast(SSHServerConnection, self))
+        methods = cast(SSHServerConnection, self).get_allowed_auth_methods()
 
         self.logger.debug2('Remaining auth methods: %s', methods or 'None')
 
@@ -2551,6 +2551,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             conn._key_options = {}
             conn._cert_options = None
 
+            if begin_auth:
+                conn._reset_auth_progress()
+
             return self._finish_userauth(begin_auth, method, packet)
 
         return None
@@ -2615,8 +2618,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         if self.is_client() and self._auth:
             auth = cast(ClientAuth, self._auth)
 
-            if partial_success: # pragma: no cover
-                # Partial success not implemented yet
+            if partial_success:
                 auth.auth_succeeded()
             else:
                 auth.auth_failed()
@@ -5918,10 +5920,16 @@ class SSHServerConnection(SSHConnection):
         self._cert_options: Optional[_KeyOrCertOptions] = None
         self._kbdint_password_auth = False
 
+        self._auth_policy: AuthPolicy = options.auth_policy
+        self._auth_stage = 0
+        self._used_auth_factors: Set[bytes] = set()
+
         self._agent_listener: Optional[SSHAgentListener] = None
 
     def _cleanup(self, exc: Optional[Exception]) -> None:
         """Clean up this server connection"""
+
+        self._reset_auth_progress()
 
         if self._agent_listener:
             self._agent_listener.close()
@@ -5963,6 +5971,8 @@ class SSHServerConnection(SSHConnection):
         self._kbdint_auth = options.kbdint_auth
         self._password_auth = options.password_auth
 
+        self._auth_policy = options.auth_policy
+
         self._authorized_client_keys = options.authorized_client_keys
         self._allow_pty = options.allow_pty
         self._x11_forwarding = options.x11_forwarding
@@ -5973,6 +5983,75 @@ class SSHServerConnection(SSHConnection):
 
         self._keepalive_count_max = options.keepalive_count_max
         self._keepalive_interval = options.keepalive_interval
+
+    def _reset_auth_progress(self) -> None:
+        """Reset staged authentication progress"""
+
+        self._auth_stage = 0
+        self._used_auth_factors.clear()
+
+    def auth_method_allowed(self, method: bytes) -> bool:
+        """Return whether an auth method is allowed in the current stage"""
+
+        return (not self._auth_policy or
+                (self._auth_stage < len(self._auth_policy) and
+                 method in self._auth_policy[self._auth_stage]))
+
+    def auth_partial_success(self) -> bool:
+        """Return whether any stages of the auth policy are complete"""
+
+        return self._auth_stage > 0
+
+    def get_allowed_auth_methods(self) -> Sequence[bytes]:
+        """Return the auth methods to advertise in the current stage"""
+
+        methods = get_supported_server_auth_methods(self)
+
+        if self._auth_policy and self._auth_stage < len(self._auth_policy):
+            allowed = self._auth_policy[self._auth_stage]
+            methods = [method for method in methods if method in allowed]
+
+        return methods
+
+    async def auth_method_completed(self, method: bytes,
+                                    factor_id: Optional[bytes] = None) -> \
+            None:
+        """Handle successful completion of an authentication method
+
+           When an authentication policy is configured, each completed
+           method satisfies one stage of the policy. If more stages
+           remain, a partial success response is sent advertising only
+           the methods allowed in the next stage. Otherwise, the
+           authentication is complete. A factor which has already been
+           used to satisfy a previous stage cannot be reused.
+
+        """
+
+        if not self._auth_policy:
+            await self.send_userauth_success()
+            return
+
+        if (self.auth_method_allowed(method) and
+                (factor_id is None or
+                 factor_id not in self._used_auth_factors)):
+            if factor_id is not None:
+                self._used_auth_factors.add(factor_id)
+
+            self._auth_stage += 1
+
+            if self._auth_stage >= len(self._auth_policy):
+                await self.send_userauth_success()
+            else:
+                self.logger.info('Auth for user %s completed stage %d of %d',
+                                 self._username, self._auth_stage,
+                                 len(self._auth_policy))
+
+                self.send_userauth_failure(partial_success=True)
+        else:
+            self.logger.info('Auth method %s not allowed for user %s in '
+                             'current auth stage', method, self._username)
+
+            self.send_userauth_failure(self.auth_partial_success())
 
     def choose_server_host_key(self,
                                peer_host_key_algs: Sequence[bytes]) -> bool:
@@ -8591,6 +8670,17 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
            Whether or not to allow password authentication. By default,
            password authentication is enabled if callbacks to validate a
            password are made available.
+       :param auth_policy: (optional)
+           A sequence of authentication stages which must all be completed
+           for authentication to succeed, allowing multi-factor
+           authentication to be enforced. Each stage can be a single
+           authentication method name or a sequence of method names, any
+           one of which will satisfy that stage. After a stage is
+           completed, a partial success response is sent and only the
+           methods allowed in the next stage are advertised. A public key
+           which satisfies one stage cannot be reused to satisfy another.
+           If not specified, authentication succeeds when any single
+           enabled authentication method succeeds.
        :param gss_host: (optional)
            The principal name to use for the host in GSS key exchange and
            authentication. If not specified, the value returned by
@@ -8910,6 +9000,7 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                 signature_algs: _AlgsArg = (), host_based_auth: _AuthArg = (),
                 public_key_auth: _AuthArg = (), kbdint_auth: _AuthArg = (),
                 password_auth: _AuthArg = (),
+                auth_policy: AuthPolicyArg = None,
                 x509_trusted_certs: CertListArg = (),
                 x509_trusted_cert_paths: Sequence[FilePath] = (),
                 x509_purposes: X509CertPurposes = 'secureShellClient',
@@ -9025,6 +9116,8 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                 read_authorized_keys(authorized_client_keys)
         else:
             self.authorized_client_keys = authorized_client_keys
+
+        self.auth_policy = normalize_auth_policy(auth_policy)
 
         if gss_host == ():
             gss_host = socket.gethostname()

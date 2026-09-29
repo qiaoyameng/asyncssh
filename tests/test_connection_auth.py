@@ -25,13 +25,15 @@ import os
 import sys
 import unittest
 
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from cryptography.exceptions import UnsupportedAlgorithm
 
 import asyncssh
+from asyncssh.constants import MSG_CHANNEL_OPEN, MSG_USERAUTH_FAILURE
 from asyncssh.misc import async_context_manager, write_file
-from asyncssh.packet import String
+from asyncssh.packet import SSHPacket, String, UInt32
 from asyncssh.public_key import CERT_TYPE_USER, CERT_TYPE_HOST
 
 from .keysign_stub import create_subprocess_exec_stub
@@ -2289,4 +2291,292 @@ class _TestServerLoginTimeoutDisabled(ServerTestCase):
         """Test with login timeout disabled"""
 
         async with self.connect(username='ckey', client_keys='ckey'):
+            pass
+
+
+class _AuthPolicyServerSession(asyncssh.SSHServerSession):
+    """Server session which accepts shell requests"""
+
+    def shell_requested(self):
+        """Return that a shell request is allowed"""
+
+        return True
+
+
+class _AuthPolicyServer(Server):
+    """Server for testing staged authentication policies"""
+
+    def __init__(self):
+        super().__init__()
+
+        self._client_keys = []
+        self.auth_completed_called = False
+
+    async def begin_auth(self, username):
+        """Handle client authentication request"""
+
+        # pylint: disable=unused-argument
+
+        self._client_keys = asyncssh.load_public_keys(['ckey.pub',
+                                                       'ckey_ecdsa.pub'])
+        return True
+
+    def public_key_auth_supported(self):
+        """Return whether or not public key authentication is supported"""
+
+        return True
+
+    def validate_public_key(self, username, key):
+        """Return whether key is an authorized client key for this user"""
+
+        # pylint: disable=unused-argument
+
+        return key in self._client_keys
+
+    def password_auth_supported(self):
+        """Return whether or not password authentication is supported"""
+
+        return True
+
+    def validate_password(self, username, password):
+        """Return whether password is valid for this user"""
+
+        # pylint: disable=unused-argument
+
+        return password == 'pw'
+
+    def session_requested(self):
+        """Handle a request to create a new session"""
+
+        return _AuthPolicyServerSession()
+
+    def auth_completed(self):
+        """Record that authentication fully completed"""
+
+        self.auth_completed_called = True
+
+
+class _UsernameSwitchClientConnection(asyncssh.SSHClientConnection):
+    """Switch usernames after the first stage of auth completes"""
+
+    async def password_auth_requested(self):
+        """Switch to a different username before attempting password auth"""
+
+        # pylint: disable=protected-access
+
+        self._username = 'other'
+
+        return 'pw'
+
+
+@contextmanager
+def _record_auth_failures(failures):
+    """Record auth failure packets processed by SSH connections"""
+
+    # pylint: disable=protected-access
+
+    handlers = asyncssh.connection.SSHConnection._packet_handlers
+    orig_handler = handlers[MSG_USERAUTH_FAILURE]
+
+    def record_failure(conn, pkttype, pktid, packet):
+        """Record advertised auth methods and partial success flag"""
+
+        probe = SSHPacket(packet.get_remaining_payload())
+        failures.append((probe.get_namelist(), probe.get_boolean()))
+
+        return orig_handler(conn, pkttype, pktid, packet)
+
+    with patch.dict(handlers, {MSG_USERAUTH_FAILURE: record_failure}):
+        yield
+
+
+class _EarlySessionClient(asyncssh.SSHClient):
+    """Test opening a session channel before auth is complete"""
+
+    def __init__(self):
+        self._conn = None
+
+    def connection_made(self, conn):
+        """Save connection for use later"""
+
+        self._conn = conn
+
+    def password_auth_requested(self):
+        """Attempt to open a session before authentication is complete"""
+
+        # pylint: disable=protected-access
+
+        self._conn._auth_complete = True
+
+        self._conn.send_packet(MSG_CHANNEL_OPEN, String('session'),
+                               UInt32(0), UInt32(0x100000), UInt32(0x8000))
+
+        return 'pw'
+
+
+class _TestAuthPolicyPublicKeyPassword(ServerTestCase):
+    """Unit tests for a publickey+password authentication policy"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server with a publickey+password auth policy"""
+
+        cls._policy_servers = []
+
+        def server_factory():
+            """Return a policy server and record it for later inspection"""
+
+            server = _AuthPolicyServer()
+            cls._policy_servers.append(server)
+            return server
+
+        return await cls.create_server(
+            server_factory, auth_policy=[['publickey'], ['password']])
+
+    @asynctest
+    async def test_publickey_then_password(self):
+        """Test public key followed by password auth succeeds"""
+
+        async with self.connect(username='user', client_keys='ckey',
+                                password='pw', agent_path=None) as conn:
+            chan, _ = await conn.create_session(asyncssh.SSHClientSession)
+            chan.close()
+
+        self.assertTrue(self._policy_servers[-1].auth_completed_called)
+
+    @asynctest
+    async def test_password_only_fails(self):
+        """Test password auth alone is not enough to authenticate"""
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='user', password='pw',
+                               client_keys=None, agent_path=None)
+
+    @asynctest
+    async def test_publickey_only_fails(self):
+        """Test public key auth alone is not enough to authenticate"""
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='user', client_keys='ckey',
+                               agent_path=None)
+
+    @asynctest
+    async def test_partial_success_advertises_next_stage(self):
+        """Test only next-stage methods are advertised on partial success"""
+
+        failures = []
+
+        with _record_auth_failures(failures):
+            async with self.connect(username='user', client_keys='ckey',
+                                    password='pw', agent_path=None):
+                pass
+
+        self.assertEqual(failures, [([b'publickey'], False),
+                                    ([b'password'], True)])
+
+    @asynctest
+    async def test_session_channel_rejected_before_auth_complete(self):
+        """Test a session channel can't be opened before auth completes"""
+
+        with self.assertRaises(asyncssh.ProtocolError):
+            await self.create_connection(_EarlySessionClient, username='user',
+                                         client_keys='ckey', agent_path=None)
+
+    @asynctest
+    async def test_username_change_resets_progress(self):
+        """Test changing the username resets staged auth progress"""
+
+        failures = []
+
+        with patch('asyncssh.connection.SSHClientConnection',
+                   _UsernameSwitchClientConnection), \
+                _record_auth_failures(failures):
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self.connect(username='user', client_keys='ckey',
+                                   agent_path=None)
+
+        # The completed public key stage must be discarded when the
+        # username changes, so only publickey is advertised again
+        self.assertEqual(failures, [([b'publickey'], False),
+                                    ([b'password'], True),
+                                    ([b'publickey'], False)])
+
+    @asynctest
+    async def test_auth_state_cleaned_up_on_close(self):
+        """Test staged auth state is cleaned up when a connection closes"""
+
+        # pylint: disable=protected-access
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='user', client_keys='ckey',
+                               agent_path=None)
+
+        await asyncio.sleep(0.1)
+
+        conn = self._policy_servers[-1]._conn
+
+        self.assertEqual(conn._auth_stage, 0)
+        self.assertFalse(conn._used_auth_factors)
+
+
+class _TestAuthPolicyTwoPublicKeys(ServerTestCase):
+    """Unit tests for a policy requiring two distinct public keys"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server requiring two public key auth stages"""
+
+        return await cls.create_server(
+            _AuthPolicyServer, auth_policy=['publickey', 'publickey'])
+
+    @asynctest
+    async def test_two_distinct_keys(self):
+        """Test two different keys can satisfy both public key stages"""
+
+        async with self.connect(username='user',
+                                client_keys=['ckey', 'ckey_ecdsa'],
+                                agent_path=None):
+            pass
+
+    @asynctest
+    async def test_same_key_twice_fails(self):
+        """Test the same key can't satisfy two public key stages"""
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='user',
+                               client_keys=['ckey', 'ckey'], agent_path=None)
+
+    @asynctest
+    async def test_single_key_fails(self):
+        """Test a single key can't satisfy two public key stages"""
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect(username='user', client_keys='ckey',
+                               agent_path=None)
+
+
+class _TestAuthPolicyEitherMethod(ServerTestCase):
+    """Unit tests for a policy allowing either of two methods"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server allowing publickey or password auth"""
+
+        return await cls.create_server(
+            _AuthPolicyServer, auth_policy=[['publickey', 'password']])
+
+    @asynctest
+    async def test_publickey_only(self):
+        """Test public key auth alone satisfies a single OR stage"""
+
+        async with self.connect(username='user', client_keys='ckey',
+                                agent_path=None):
+            pass
+
+    @asynctest
+    async def test_password_only(self):
+        """Test password auth alone satisfies a single OR stage"""
+
+        async with self.connect(username='user', password='pw',
+                                client_keys=None, agent_path=None):
             pass

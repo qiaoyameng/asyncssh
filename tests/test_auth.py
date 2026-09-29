@@ -31,6 +31,7 @@ import asyncssh
 from asyncssh.auth import MSG_USERAUTH_GSSAPI_RESPONSE, MSG_USERAUTH_PK_OK
 from asyncssh.auth import ServerAuth, lookup_client_auth, lookup_server_auth
 from asyncssh.auth import get_supported_server_auth_methods
+from asyncssh.auth import normalize_auth_policy
 from asyncssh.constants import MSG_USERAUTH_REQUEST, MSG_USERAUTH_FAILURE
 from asyncssh.constants import MSG_USERAUTH_SUCCESS
 from asyncssh.gss import GSSClient, GSSServer
@@ -260,11 +261,21 @@ class _AuthClientStub(_AuthConnectionStub):
 class _AuthServerStub(_AuthConnectionStub):
     """Stub class for server connection"""
 
+    # pylint: disable=protected-access
+
+    # Use the real staged authentication policy implementation
+    _reset_auth_progress = asyncssh.SSHServerConnection._reset_auth_progress
+    auth_method_allowed = asyncssh.SSHServerConnection.auth_method_allowed
+    auth_partial_success = asyncssh.SSHServerConnection.auth_partial_success
+    get_allowed_auth_methods = \
+        asyncssh.SSHServerConnection.get_allowed_auth_methods
+    auth_method_completed = asyncssh.SSHServerConnection.auth_method_completed
+
     def __init__(self, peer=None, gss_host=None, override_gss_mech=False,
                  host_based_auth=False, public_key_auth=False,
                  override_pk_ok=False, password_auth=False,
                  password_change_prompt=None, kbdint_auth=False,
-                 kbdint_challenge=False, success=False):
+                 kbdint_challenge=False, success=False, auth_policy=None):
         super().__init__(peer, True)
 
         self._gss = GSSServer(gss_host, None) if gss_host else None
@@ -284,6 +295,11 @@ class _AuthServerStub(_AuthConnectionStub):
         self._success = success
 
         self._auth = None
+
+        self._username = ''
+        self._auth_policy = normalize_auth_policy(auth_policy)
+        self._auth_stage = 0
+        self._used_auth_factors = set()
 
     @property
     def auth(self):
@@ -310,12 +326,16 @@ class _AuthServerStub(_AuthConnectionStub):
         pkttype = packet.get_byte()
 
         if pkttype == MSG_USERAUTH_REQUEST:
-            _ = packet.get_string()         # username
+            username = packet.get_string().decode('utf-8')
             _ = packet.get_string()         # service
             method = packet.get_string()
 
             if self._auth:
                 self._auth.cancel()
+
+            if username != self._username:
+                self._username = username
+                self._reset_auth_progress()
 
             if self._override_gss_mech:
                 self.send_userauth_packet(MSG_USERAUTH_GSSAPI_RESPONSE,
@@ -324,7 +344,7 @@ class _AuthServerStub(_AuthConnectionStub):
                 self.send_userauth_packet(MSG_USERAUTH_PK_OK, String(''),
                                           String(''))
             else:
-                self._auth = lookup_server_auth(self, 'user', method, packet)
+                self._auth = lookup_server_auth(self, username, method, packet)
         else:
             result = self._auth.process_packet(pkttype, None, packet)
 
@@ -335,7 +355,8 @@ class _AuthServerStub(_AuthConnectionStub):
         """Send a user authentication failure response"""
 
         self._auth = None
-        self.send_userauth_packet(MSG_USERAUTH_FAILURE, NameList([]),
+        self.send_userauth_packet(MSG_USERAUTH_FAILURE,
+                                  NameList(self.get_allowed_auth_methods()),
                                   Boolean(partial_success))
 
     async def send_userauth_success(self):
@@ -730,6 +751,262 @@ class _TestAuth(AsyncTestCase):
                                   kbdint_auth=True, kbdint_submethods='',
                                   kbdint_challenge=True, kbdint_response=True,
                                   success=True)
+
+
+class _AuthPeerStub:
+    """Capture packets sent by an authentication server stub"""
+
+    def __init__(self):
+        self.packets = asyncio.Queue()
+
+    def queue_packet(self, data):
+        """Queue a packet sent by the server"""
+
+        self.packets.put_nowait(data)
+
+    def connection_lost(self, exc=None):
+        """Handle the closing of the connection"""
+
+    def close(self):
+        """Close the connection"""
+
+
+class _TestAuthPolicy(AsyncTestCase):
+    """Unit tests for staged server authentication policies"""
+
+    # pylint: disable=protected-access
+
+    def setUp(self):
+        """Initialize the list of server auth stubs to clean up"""
+
+        super().setUp()
+
+        self._servers = []
+
+    async def asyncTearDown(self):
+        """Clean up server auth stubs"""
+
+        for server in self._servers:
+            server.close()
+
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    @staticmethod
+    def _userauth_request(username, method, *args):
+        """Build a user authentication request packet"""
+
+        return (Byte(MSG_USERAUTH_REQUEST) + String(username) +
+                String('ssh-connection') + String(method) + b''.join(args))
+
+    @staticmethod
+    async def _read_packet(peer):
+        """Read a packet sent by the server"""
+
+        data = await asyncio.wait_for(peer.packets.get(), 5)
+        packet = SSHPacket(data)
+
+        return packet.get_byte(), packet
+
+    async def _read_failure(self, peer):
+        """Read a user authentication failure packet"""
+
+        pkttype, packet = await self._read_packet(peer)
+
+        self.assertEqual(pkttype, MSG_USERAUTH_FAILURE)
+
+        methods = packet.get_namelist()
+        partial_success = packet.get_boolean()
+        packet.check_end()
+
+        return methods, partial_success
+
+    def _make_server(self, policy):
+        """Make a server auth stub with an authentication policy"""
+
+        peer = _AuthPeerStub()
+        server = _AuthServerStub(peer, public_key_auth=True,
+                                 password_auth=True, success=True,
+                                 auth_policy=policy)
+
+        self._servers.append(server)
+
+        return server, peer
+
+    def _send_publickey(self, server, key, sign=True, username='user'):
+        """Send a public key authentication request"""
+
+        signature = (String(b'sig'),) if sign else ()
+
+        server.queue_packet(self._userauth_request(
+            username, 'publickey', Boolean(sign), String(key.algorithm),
+            String(key.public_data), *signature))
+
+    def _send_password(self, server, password='pw', username='user'):
+        """Send a password authentication request"""
+
+        server.queue_packet(self._userauth_request(
+            username, 'password', Boolean(False), String(password)))
+
+    @asynctest
+    async def test_and_stages(self):
+        """Test a policy requiring both public key and password auth"""
+
+        ckey = get_test_key('ssh-rsa')
+        server, peer = self._make_server([['publickey'], ['password']])
+
+        # A public key probe must not count as completing a factor
+        self._send_publickey(server, ckey, sign=False)
+
+        pkttype, _ = await self._read_packet(peer)
+        self.assertEqual(pkttype, MSG_USERAUTH_PK_OK)
+        self.assertEqual(server._auth_stage, 0)
+
+        # Password auth is not accepted until the public key stage completes
+        self._send_password(server)
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'publickey'])
+        self.assertFalse(partial_success)
+        self.assertEqual(server._auth_stage, 0)
+
+        # A signed public key request completes the first stage
+        self._send_publickey(server, ckey)
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'password'])
+        self.assertTrue(partial_success)
+        self.assertEqual(server._auth_stage, 1)
+
+        # Password auth then completes the second stage
+        self._send_password(server)
+
+        pkttype, _ = await self._read_packet(peer)
+        self.assertEqual(pkttype, MSG_USERAUTH_SUCCESS)
+        self.assertEqual(server._auth_stage, 2)
+
+    @asynctest
+    async def test_or_stage(self):
+        """Test a policy allowing any of multiple methods in a stage"""
+
+        server, peer = self._make_server([['publickey', 'password']])
+
+        self._send_password(server)
+
+        pkttype, _ = await self._read_packet(peer)
+        self.assertEqual(pkttype, MSG_USERAUTH_SUCCESS)
+
+    @asynctest
+    async def test_publickey_reuse(self):
+        """Test that one key can't satisfy two public key stages"""
+
+        ckey1 = get_test_key('ssh-rsa')
+        ckey2 = get_test_key('ecdsa-sha2-nistp256')
+        server, peer = self._make_server([['publickey'], ['publickey']])
+
+        self._send_publickey(server, ckey1)
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'publickey'])
+        self.assertTrue(partial_success)
+        self.assertEqual(server._auth_stage, 1)
+
+        # Reusing the same key must not satisfy the second stage
+        self._send_publickey(server, ckey1)
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'publickey'])
+        self.assertTrue(partial_success)
+        self.assertEqual(server._auth_stage, 1)
+
+        # A different key completes the second stage
+        self._send_publickey(server, ckey2)
+
+        pkttype, _ = await self._read_packet(peer)
+        self.assertEqual(pkttype, MSG_USERAUTH_SUCCESS)
+
+    @asynctest
+    async def test_factor_reuse_after_reset(self):
+        """Test that resetting auth progress clears used factors"""
+
+        ckey = get_test_key('ssh-rsa')
+        server, peer = self._make_server([['publickey'], ['publickey']])
+
+        self._send_publickey(server, ckey)
+
+        await self._read_failure(peer)
+        self.assertEqual(server._auth_stage, 1)
+
+        server._reset_auth_progress()
+
+        self.assertEqual(server._auth_stage, 0)
+        self.assertFalse(server._used_auth_factors)
+
+        # The same key is accepted again after the reset
+        self._send_publickey(server, ckey)
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'publickey'])
+        self.assertTrue(partial_success)
+        self.assertEqual(server._auth_stage, 1)
+
+    @asynctest
+    async def test_username_change_resets_progress(self):
+        """Test that changing the username resets auth progress"""
+
+        ckey = get_test_key('ssh-rsa')
+        server, peer = self._make_server([['publickey'], ['password']])
+
+        self._send_publickey(server, ckey)
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'password'])
+        self.assertTrue(partial_success)
+        self.assertEqual(server._auth_stage, 1)
+
+        # The completed stage must be discarded when the username changes
+        self._send_password(server, username='other')
+
+        methods, partial_success = await self._read_failure(peer)
+        self.assertEqual(methods, [b'publickey'])
+        self.assertFalse(partial_success)
+        self.assertEqual(server._auth_stage, 0)
+
+    def test_policy_validation(self):
+        """Test validation of authentication policies"""
+
+        self.assertEqual(normalize_auth_policy(None), ())
+        self.assertEqual(normalize_auth_policy([]), ())
+        self.assertEqual(normalize_auth_policy(['publickey', 'password']),
+                         (frozenset({b'publickey'}), frozenset({b'password'})))
+        self.assertEqual(normalize_auth_policy([[b'publickey', 'password']]),
+                         (frozenset({b'publickey', b'password'}),))
+
+        with self.assertRaises(ValueError):
+            normalize_auth_policy([['unknown']])
+
+        with self.assertRaises(ValueError):
+            normalize_auth_policy([['none']])
+
+        with self.assertRaises(ValueError):
+            normalize_auth_policy([[]])
+
+    def test_options_auth_policy(self):
+        """Test auth policy normalization in server connection options"""
+
+        get_test_key('ssh-rsa', 1).write_private_key('skey')
+
+        options = asyncssh.SSHServerConnectionOptions(
+            server_host_keys=['skey'], gss_host=None,
+            auth_policy=[['publickey'], ['password']])
+
+        self.assertEqual(options.auth_policy,
+                         (frozenset({b'publickey'}), frozenset({b'password'})))
+
+        with self.assertRaises(ValueError):
+            asyncssh.SSHServerConnectionOptions(
+                server_host_keys=['skey'], gss_host=None,
+                auth_policy=[['unknown']])
 
 
 class TestAuthenticationGenerationRegression(unittest.IsolatedAsyncioTestCase):
