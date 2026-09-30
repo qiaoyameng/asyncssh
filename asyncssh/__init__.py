@@ -28,7 +28,8 @@ from .constants import *
 
 # pylint: enable=wildcard-import
 
-from .agent import SSHAgentClient, SSHAgentKeyPair, connect_agent
+from .agent import SSHAgentClient, SSHAgentForwardingFilter, SSHAgentKeyPair
+from .agent import connect_agent
 
 from .auth_keys import SSHAuthorizedKeys
 from .auth_keys import import_authorized_keys, read_authorized_keys
@@ -148,7 +149,8 @@ __all__ = [
     'SFTPOwnerInvalid', 'SFTPPermissionDenied', 'SFTPQuotaExceeded',
     'SFTPServer', 'SFTPServerFactory', 'SFTPUnknownPrincipal', 'SFTPVFSAttrs',
     'SFTPWriteProtect', 'SSHAcceptHandler', 'SSHAcceptor', 'SSHAgentClient',
-    'SSHAgentKeyPair', 'SSHAuthorizedKeys', 'SSHCertificate', 'SSHClient',
+    'SSHAgentForwardingFilter', 'SSHAgentKeyPair', 'SSHAuthorizedKeys',
+    'SSHCertificate', 'SSHClient',
     'SSHClientChannel', 'SSHClientConnection', 'SSHClientConnectionOptions',
     'SSHClientProcess', 'SSHClientSession', 'SSHCompletedProcess',
     'SSHForwarder', 'SSHKey', 'SSHKeyPair', 'SSHKnownHosts',

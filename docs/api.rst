@@ -1533,6 +1533,16 @@ by specifying the ``agent_forwarding`` argument when calling
 :func:`create_connection`, allowing processes running on the server
 to tunnel requests back over the SSH connection to the client's ssh-agent.
 
+Forwarded agent access can be restricted to a specific set of keys by
+specifying the ``agent_forward_identities`` argument when calling
+:func:`create_connection`. In this mode, requests are proxied through an
+:class:`SSHAgentForwardingFilter` which only allows the remote end to
+list and sign with the allowed identities. Complete agent frames are
+validated before being forwarded, unknown operations are denied, and
+all outstanding requests are cancelled when the SSH session is closed.
+Private keys are never read or copied -- all signing is still performed
+by the local ssh-agent.
+
 Agent forwarding can be enabled when starting an SSH server by
 specifying the ``agent_forwarding`` argument when calling
 :func:`create_server`. In this case, the client's ssh-agent can be
@@ -1558,6 +1568,12 @@ socket are forwarded over the SSH connection to the client's ssh-agent.
    .. automethod:: query_extensions
    .. automethod:: close
    .. automethod:: wait_closed
+
+.. autoclass:: SSHAgentForwardingFilter()
+
+   ===================================== =
+   .. automethod:: connect
+   .. automethod:: close
    ===================================== =
 
 .. autoclass:: SSHAgentKeyPair()

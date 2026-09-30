@@ -24,12 +24,12 @@ import asyncio
 import os
 import sys
 from types import TracebackType
-from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Tuple
-from typing import Type, Union
+from typing import TYPE_CHECKING, Any, Coroutine, List, Optional, Protocol
+from typing import Sequence, Set, Tuple, Type, Union
 from typing_extensions import Self
 
 from .listener import SSHForwardListener
-from .misc import async_context_manager, maybe_wait_closed
+from .misc import ChannelOpenError, async_context_manager, maybe_wait_closed
 from .packet import Byte, String, UInt32, PacketDecodeError, SSHPacket
 from .public_key import KeyPairListArg, SSHCertificate, SSHKeyPair
 from .public_key import load_default_keypairs, load_keypairs
@@ -103,6 +103,9 @@ SSH_AGENT_CONSTRAIN_EXTENSION            = 255
 # SSH agent signature flags
 SSH_AGENT_RSA_SHA2_256                   = 2
 SSH_AGENT_RSA_SHA2_512                   = 4
+
+# Maximum allowed size of an SSH agent frame (matches OpenSSH)
+SSH_AGENT_MAX_PACKET                     = 256 * 1024
 
 
 class SSHAgentKeyPair(SSHKeyPair):
@@ -607,6 +610,272 @@ class SSHAgentClient:
 
             self._reader = None
             self._writer = None
+
+
+class SSHAgentForwardingFilter:
+    """Filter which restricts access to a forwarded SSH agent
+
+       This class acts as a session for a forwarded SSH agent channel,
+       only allowing the remote end to list and sign with an allowed
+       set of public keys. All other agent operations are denied.
+
+       Complete agent frames are validated before any request is
+       forwarded, so fragmented or coalesced frames can't be used to
+       bypass the filtering. Only public key blobs are ever examined --
+       private keys are never read or copied, and all signing is
+       performed by the local SSH agent.
+
+       The set of allowed identities is fixed when the filter is
+       created, binding the authorization to a single forwarded
+       session. When the channel is closed, all outstanding requests
+       are cancelled and the connection to the local agent is closed.
+
+       :param agent_path:
+           The path of the local ssh-agent to forward requests to, or
+           an :class:`SSHServerConnection` to forward requests over.
+       :param allowed_identities:
+           A list of public key or certificate blobs in binary SSH
+           format which the remote end is allowed to see and sign with.
+       :type agent_path: `str` or :class:`SSHServerConnection`
+       :type allowed_identities: `list` of `bytes`
+
+    """
+
+    def __init__(self, agent_path: _AgentPath,
+                 allowed_identities: Sequence[bytes]):
+        self._agent_path = agent_path
+        self._allowed = frozenset(allowed_identities)
+        self._agent: Optional[SSHAgentClient] = None
+        self._transport: Optional[asyncio.Transport] = None
+        self._identities: List[Tuple[bytes, bytes]] = []
+        self._inpbuf = b''
+        self._request_lock = asyncio.Lock()
+        self._tasks: Set['asyncio.Task[None]'] = set()
+        self._recv_eof = False
+        self._closed = False
+
+    async def connect(self) -> None:
+        """Connect to the local SSH agent and fetch allowed identities
+
+           This method is a coroutine which connects to the local
+           ssh-agent and caches the list of allowed identities to
+           advertise to the remote end. Only identities in the allowed
+           set are returned, and the private keys remain in the agent.
+
+           :raises: :exc:`OSError`, :exc:`ChannelOpenError`, or
+                    :exc:`ValueError` if the agent can't be contacted
+                    or returns an invalid response
+
+        """
+
+        agent = SSHAgentClient(self._agent_path)
+
+        try:
+            await agent.connect()
+
+            if self._allowed:
+                keys = await agent.get_keys(list(self._allowed))
+                self._identities = [(key.public_data,
+                                     key.get_comment_bytes())
+                                    for key in keys]
+        except (OSError, ChannelOpenError, ValueError):
+            agent.close()
+            raise
+
+        self._agent = agent
+
+    def _add_task(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Add a background task, cancelled when the filter is closed"""
+
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: 'asyncio.Task[None]') -> None:
+        """Clean up a completed background task"""
+
+        self._tasks.discard(task)
+
+        if not task.cancelled() and task.exception():
+            self.close()
+        elif self._recv_eof and not self._tasks:
+            self.close()
+
+    def _send_response(self, msgtype: int, *args: bytes) -> None:
+        """Send an SSH agent response to the remote end"""
+
+        if self._transport and not self._closed:
+            payload = Byte(msgtype) + b''.join(args)
+
+            try:
+                self._transport.write(UInt32(len(payload)) + payload)
+            except OSError:
+                self.close()
+
+    def _send_failure(self) -> None:
+        """Send an SSH agent failure response to the remote end"""
+
+        self._send_response(SSH_AGENT_FAILURE)
+
+    def _handle_frame(self, frame: bytes) -> None:
+        """Handle a complete, validated SSH agent frame"""
+
+        self._add_task(self._process_frame(frame))
+
+    async def _process_frame(self, frame: bytes) -> None:
+        """Process a single SSH agent request frame
+
+           Requests are serialized through a lock so responses are
+           always sent in the order the requests were received.
+
+        """
+
+        async with self._request_lock:
+            if self._closed:
+                return
+
+            msgtype = frame[0]
+
+            if msgtype == SSH_AGENTC_REQUEST_IDENTITIES:
+                self._process_request_identities(frame)
+            elif msgtype == SSH_AGENTC_SIGN_REQUEST:
+                await self._process_sign_request(frame)
+            else:
+                self._send_failure()
+
+    def _process_request_identities(self, frame: bytes) -> None:
+        """Process a request to list allowed identities"""
+
+        if len(frame) != 1:
+            self._send_failure()
+            return
+
+        args = [UInt32(len(self._identities))]
+
+        for key_blob, comment in self._identities:
+            args.append(String(key_blob))
+            args.append(String(comment))
+
+        self._send_response(SSH_AGENT_IDENTITIES_ANSWER, *args)
+
+    async def _process_sign_request(self, frame: bytes) -> None:
+        """Process a request to sign data with an allowed key"""
+
+        try:
+            packet = SSHPacket(frame[1:])
+            key_blob = packet.get_string()
+            data = packet.get_string()
+            flags = packet.get_uint32()
+            packet.check_end()
+        except PacketDecodeError:
+            self._send_failure()
+            return
+
+        if key_blob not in self._allowed:
+            self._send_failure()
+            return
+
+        assert self._agent is not None
+
+        try:
+            sig = await self._agent.sign(key_blob, data, flags)
+        except ValueError:
+            self._send_failure()
+            self.close()
+        else:
+            self._send_response(SSH_AGENT_SIGN_RESPONSE, String(sig))
+
+    def connection_made(self, transport: asyncio.Transport) -> None:
+        """Handle a newly opened forwarded agent channel"""
+
+        self._transport = transport
+
+    def session_started(self) -> None:
+        """Handle session start"""
+
+    def data_received(self, data: bytes,
+                      datatype: Optional[int] = None) -> None:
+        """Handle incoming data from the remote end
+
+           Data is buffered until a complete agent frame is available.
+           Each frame is validated and filtered individually, so
+           fragmented or coalesced frames can't bypass the filter.
+
+        """
+
+        # pylint: disable=unused-argument
+
+        if self._closed or self._recv_eof:
+            return
+
+        self._inpbuf += data
+
+        while len(self._inpbuf) >= 4:
+            framelen = int.from_bytes(self._inpbuf[:4], 'big')
+
+            if not 1 <= framelen <= SSH_AGENT_MAX_PACKET:
+                self.close()
+                return
+
+            if len(self._inpbuf) < 4 + framelen:
+                return
+
+            frame = self._inpbuf[4:4+framelen]
+            self._inpbuf = self._inpbuf[4+framelen:]
+
+            self._handle_frame(frame)
+
+    def eof_received(self) -> bool:
+        """Handle an incoming end of file from the remote end"""
+
+        self._recv_eof = True
+
+        if not self._tasks:
+            self.close()
+
+        return False
+
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        """Handle an incoming channel close"""
+
+        # pylint: disable=unused-argument
+
+        self.close()
+
+    def pause_writing(self) -> None:
+        """Pause writing to the remote end"""
+
+    def resume_writing(self) -> None:
+        """Resume writing to the remote end"""
+
+    def close(self) -> None:
+        """Close the filter, cancelling all outstanding requests
+
+           This closes the forwarded channel and the connection to the
+           local SSH agent, and cancels any requests still in progress.
+
+        """
+
+        if self._closed:
+            return
+
+        self._closed = True
+
+        current_task = asyncio.current_task()
+
+        for task in self._tasks:
+            if task is not current_task:
+                task.cancel()
+
+        self._tasks.clear()
+
+        if self._agent:
+            self._agent.close()
+
+        if self._transport:
+            transport = self._transport
+            self._transport = None
+            transport.close()
 
 
 class SSHAgentListener:

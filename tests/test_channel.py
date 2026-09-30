@@ -948,6 +948,38 @@ class _TestChannel(ServerTestCase):
             self.assertEqual(result, '3\n')
 
     @asynctest
+    async def test_agent_forwarding_restricted(self):
+        """Test SSH agent forwarding restricted to allowed identities"""
+
+        if not self.agent_available(): # pragma: no cover
+            self.skipTest('ssh-agent not available')
+
+        async with self.connect(username='ckey', agent_forwarding=True,
+                                agent_forward_identities=['ckey.pub']) as conn:
+            chan, session = await _create_session(conn, 'agent')
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, '1\n')
+
+    @asynctest
+    async def test_agent_forwarding_restricted_no_match(self):
+        """Test restricted SSH agent forwarding matching no identities"""
+
+        if not self.agent_available(): # pragma: no cover
+            self.skipTest('ssh-agent not available')
+
+        async with self.connect(username='ckey', agent_forwarding=True,
+                                agent_forward_identities=[]) as conn:
+            chan, session = await _create_session(conn, 'agent')
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, '0\n')
+
+    @asynctest
     async def test_rejected_session(self):
         """Test receiving inbound session request"""
 

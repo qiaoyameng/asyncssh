@@ -31,9 +31,12 @@ import unittest
 import asyncssh
 
 from asyncssh.agent import SSH_AGENT_SUCCESS, SSH_AGENT_FAILURE
-from asyncssh.agent import SSH_AGENT_IDENTITIES_ANSWER
+from asyncssh.agent import SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE
+from asyncssh.agent import SSH_AGENTC_REQUEST_IDENTITIES
+from asyncssh.agent import SSH_AGENTC_SIGN_REQUEST, SSH_AGENTC_ADD_IDENTITY
+from asyncssh.agent import SSH_AGENTC_REMOVE_ALL_IDENTITIES
 from asyncssh.crypto import ed25519_available
-from asyncssh.packet import Byte, String, UInt32
+from asyncssh.packet import Byte, String, UInt32, SSHPacket
 
 from .sk_stub import sk_available, patch_sk
 from .util import AsyncTestCase, asynctest, get_test_key, run, try_remove
@@ -494,3 +497,579 @@ class _TestAgent(AsyncTestCase):
                             await request
 
             await mock_agent.stop()
+
+
+class _FakeAgentConnection:
+    """In-memory connection to a fake SSH agent"""
+
+    def __init__(self, agent):
+        self._agent = agent
+        self._send_buf = b''
+        self._recv_buf = b''
+        self._recv_eof = False
+        self._recv_event = asyncio.Event()
+        self._closed = False
+        self._processing = False
+
+    async def readexactly(self, n):
+        """Read exactly n bytes of response data from the agent"""
+
+        while len(self._recv_buf) < n:
+            if self._recv_eof:
+                raise asyncio.IncompleteReadError(self._recv_buf, n)
+
+            self._recv_event.clear()
+            await self._recv_event.wait()
+
+        result, self._recv_buf = self._recv_buf[:n], self._recv_buf[n:]
+
+        return result
+
+    def write(self, data):
+        """Write request data to the agent"""
+
+        if self._closed:
+            return
+
+        self._send_buf += data
+
+        if not self._processing:
+            self._processing = True
+            asyncio.ensure_future(self._process_requests())
+
+    def close(self):
+        """Close the connection to the agent"""
+
+        self._closed = True
+        self._recv_eof = True
+        self._recv_event.set()
+
+    async def wait_closed(self):
+        """Wait for the connection to the agent to close"""
+
+    def feed_eof(self):
+        """Feed end of file to the reader"""
+
+        self._recv_eof = True
+        self._recv_event.set()
+
+    async def _process_requests(self):
+        """Process complete request frames written to the agent"""
+
+        try:
+            while len(self._send_buf) >= 4:
+                length = int.from_bytes(self._send_buf[:4], 'big')
+
+                if len(self._send_buf) < 4 + length:
+                    break
+
+                payload = self._send_buf[4:4+length]
+                self._send_buf = self._send_buf[4+length:]
+
+                response = await self._agent.handle_request(payload)
+
+                if response is None:
+                    self.feed_eof()
+                    break
+
+                self._recv_buf += UInt32(len(response)) + response
+                self._recv_event.set()
+        finally:
+            self._processing = False
+
+
+class _FakeAgent:
+    """Fake SSH agent speaking the SSH agent protocol in memory"""
+
+    def __init__(self, keys):
+        self._keys = keys
+        self.sign_requests = []
+        self.disconnect_on_sign = False
+        self.sign_event = None
+
+    async def open_agent_connection(self):
+        """Open an in-memory connection to the fake SSH agent"""
+
+        conn = _FakeAgentConnection(self)
+
+        return conn, conn
+
+    async def handle_request(self, payload):
+        """Handle a request sent to the fake SSH agent"""
+
+        msgtype = payload[0]
+
+        if msgtype == SSH_AGENTC_REQUEST_IDENTITIES:
+            response = Byte(SSH_AGENT_IDENTITIES_ANSWER) + \
+                       UInt32(len(self._keys))
+
+            for key_blob, comment in self._keys:
+                response += String(key_blob) + String(comment)
+
+            return response
+
+        if msgtype == SSH_AGENTC_SIGN_REQUEST:
+            packet = SSHPacket(payload[1:])
+            key_blob = packet.get_string()
+            data = packet.get_string()
+            flags = packet.get_uint32()
+
+            self.sign_requests.append((key_blob, data, flags))
+
+            if self.disconnect_on_sign:
+                return None
+
+            if self.sign_event:
+                await self.sign_event.wait()
+
+            if key_blob not in [blob for blob, _ in self._keys]:
+                return Byte(SSH_AGENT_FAILURE)
+
+            sig = String(b'ssh-fake') + String(b'sig:' + data)
+
+            return Byte(SSH_AGENT_SIGN_RESPONSE) + String(sig)
+
+        return Byte(SSH_AGENT_FAILURE)
+
+
+class _FakeChannelTransport:
+    """Fake channel transport capturing data written by a filter"""
+
+    def __init__(self):
+        self.data = b''
+        self.closed = False
+
+    def write(self, data):
+        """Write data to the transport"""
+
+        self.data += data
+
+    def close(self):
+        """Close the transport"""
+
+        self.closed = True
+
+
+class _FailingChannelTransport(_FakeChannelTransport):
+    """Fake channel transport which fails on write"""
+
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    def write(self, data):
+        """Raise an error on write"""
+
+        # pylint: disable=unused-argument
+
+        raise self._exc
+
+
+class _TestAgentForwardingFilter(AsyncTestCase):
+    """Unit tests for SSH agent forwarding filter"""
+
+    def setUp(self):
+        """Set up keys for the tests to use"""
+
+        super().setUp()
+
+        self.allowed_key = get_test_key('ssh-rsa')
+        self.other_key = get_test_key('ssh-rsa', 1)
+
+        self.keys = [(self.allowed_key.public_data, b'allowed'),
+                     (self.other_key.public_data, b'other')]
+
+    async def _start_filter(self, agent, allowed_identities):
+        """Start a forwarding filter connected to a fake SSH agent"""
+
+        agent_filter = asyncssh.SSHAgentForwardingFilter(
+            agent, allowed_identities)
+        await agent_filter.connect()
+
+        transport = _FakeChannelTransport()
+        agent_filter.connection_made(transport)
+
+        return agent_filter, transport
+
+    async def _wait_response(self, transport, start):
+        """Wait for a response frame and return its type and payload"""
+
+        resplen = None
+
+        for _ in range(1000):
+            await asyncio.sleep(0.001)
+
+            if len(transport.data) >= start + 4:
+                resplen = int.from_bytes(transport.data[start:start+4], 'big')
+
+                if len(transport.data) >= start + 4 + resplen:
+                    break
+        else:
+            self.fail('Timed out waiting for SSH agent response')
+
+        resp = SSHPacket(transport.data[start+4:start+4+resplen])
+
+        return resp.get_byte(), resp, start + 4 + resplen
+
+    async def _send_request(self, agent_filter, transport, payload):
+        """Send a request frame and return the response type and payload"""
+
+        start = len(transport.data)
+        agent_filter.data_received(UInt32(len(payload)) + payload)
+
+        resptype, resp, _ = await self._wait_response(transport, start)
+
+        return resptype, resp
+
+    @staticmethod
+    def _sign_request(key_blob, data=b'data', flags=0):
+        """Build an SSH agent sign request payload"""
+
+        return Byte(SSH_AGENTC_SIGN_REQUEST) + String(key_blob) + \
+               String(data) + UInt32(flags)
+
+    @asynctest
+    async def test_allowed_key_can_sign(self):
+        """Test that an allowed key can sign through the filter"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        resptype, resp = await self._send_request(
+            agent_filter, transport,
+            self._sign_request(self.allowed_key.public_data))
+
+        self.assertEqual(resptype, SSH_AGENT_SIGN_RESPONSE)
+        self.assertEqual(resp.get_string(),
+                         String(b'ssh-fake') + String(b'sig:data'))
+        resp.check_end()
+
+        self.assertEqual(agent.sign_requests,
+                         [(self.allowed_key.public_data, b'data', 0)])
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_other_key_not_visible(self):
+        """Test that non-allowed keys are neither visible nor usable"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        resptype, resp = await self._send_request(
+            agent_filter, transport, Byte(SSH_AGENTC_REQUEST_IDENTITIES))
+
+        self.assertEqual(resptype, SSH_AGENT_IDENTITIES_ANSWER)
+        self.assertEqual(resp.get_uint32(), 1)
+        self.assertEqual(resp.get_string(), self.allowed_key.public_data)
+        self.assertEqual(resp.get_string(), b'allowed')
+        resp.check_end()
+
+        resptype, _ = await self._send_request(
+            agent_filter, transport,
+            self._sign_request(self.other_key.public_data))
+
+        self.assertEqual(resptype, SSH_AGENT_FAILURE)
+        self.assertEqual(agent.sign_requests, [])
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_empty_allowed_identities(self):
+        """Test that an empty allowed list hides and denies all keys"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(agent, [])
+
+        resptype, resp = await self._send_request(
+            agent_filter, transport, Byte(SSH_AGENTC_REQUEST_IDENTITIES))
+
+        self.assertEqual(resptype, SSH_AGENT_IDENTITIES_ANSWER)
+        self.assertEqual(resp.get_uint32(), 0)
+        resp.check_end()
+
+        resptype, _ = await self._send_request(
+            agent_filter, transport,
+            self._sign_request(self.allowed_key.public_data))
+
+        self.assertEqual(resptype, SSH_AGENT_FAILURE)
+        self.assertEqual(agent.sign_requests, [])
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_unknown_operation_denied(self):
+        """Test that unknown agent operations are denied by default"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        for msgtype in (SSH_AGENTC_ADD_IDENTITY,
+                        SSH_AGENTC_REMOVE_ALL_IDENTITIES, 0xff):
+            resptype, _ = await self._send_request(
+                agent_filter, transport, Byte(msgtype))
+
+            self.assertEqual(resptype, SSH_AGENT_FAILURE)
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_fragmented_frame(self):
+        """Test that fragmented frames can't bypass the filter"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        payload = self._sign_request(self.other_key.public_data)
+        frame = UInt32(len(payload)) + payload
+
+        for i in range(0, len(frame), 3):
+            agent_filter.data_received(frame[i:i+3])
+            await asyncio.sleep(0)
+
+        resptype, _, _ = await self._wait_response(transport, 0)
+
+        self.assertEqual(resptype, SSH_AGENT_FAILURE)
+        self.assertEqual(agent.sign_requests, [])
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_merged_frames(self):
+        """Test that coalesced frames are filtered individually"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        payload1 = Byte(SSH_AGENTC_REQUEST_IDENTITIES)
+        payload2 = self._sign_request(self.other_key.public_data)
+        payload3 = self._sign_request(self.allowed_key.public_data)
+
+        agent_filter.data_received(UInt32(len(payload1)) + payload1 +
+                                   UInt32(len(payload2)) + payload2 +
+                                   UInt32(len(payload3)) + payload3)
+
+        resptype, resp, offset = await self._wait_response(transport, 0)
+        self.assertEqual(resptype, SSH_AGENT_IDENTITIES_ANSWER)
+        self.assertEqual(resp.get_uint32(), 1)
+
+        resptype, _, offset = await self._wait_response(transport, offset)
+        self.assertEqual(resptype, SSH_AGENT_FAILURE)
+
+        resptype, _, _ = await self._wait_response(transport, offset)
+        self.assertEqual(resptype, SSH_AGENT_SIGN_RESPONSE)
+
+        self.assertEqual(agent.sign_requests,
+                         [(self.allowed_key.public_data, b'data', 0)])
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_malformed_frame_length(self):
+        """Test that malformed frame lengths close the channel"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        for framelen in (0, 0x7fffffff):
+            agent_filter.data_received(UInt32(framelen))
+            await asyncio.sleep(0.1)
+
+            self.assertTrue(transport.closed)
+
+            agent_filter.data_received(b'xxx')
+
+            agent_filter.close()
+
+            if framelen == 0:
+                agent_filter, transport = await self._start_filter(
+                    agent, [self.allowed_key.public_data])
+
+    @asynctest
+    async def test_malformed_sign_request(self):
+        """Test that malformed sign requests are denied"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        for payload in (Byte(SSH_AGENTC_SIGN_REQUEST),
+                        Byte(SSH_AGENTC_SIGN_REQUEST) + b'\xff',
+                        Byte(SSH_AGENTC_SIGN_REQUEST) +
+                        String(self.allowed_key.public_data),
+                        Byte(SSH_AGENTC_REQUEST_IDENTITIES) + b'extra'):
+            resptype, _ = await self._send_request(agent_filter, transport,
+                                                   payload)
+
+            self.assertEqual(resptype, SSH_AGENT_FAILURE)
+
+        self.assertEqual(agent.sign_requests, [])
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_upstream_disconnect(self):
+        """Test that upstream disconnect fails the request and closes"""
+
+        agent = _FakeAgent(self.keys)
+        agent.disconnect_on_sign = True
+
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        resptype, _ = await self._send_request(
+            agent_filter, transport,
+            self._sign_request(self.allowed_key.public_data))
+
+        self.assertEqual(resptype, SSH_AGENT_FAILURE)
+        self.assertTrue(transport.closed)
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_close_cancels_pending_requests(self):
+        """Test that closing the filter cancels outstanding requests"""
+
+        agent = _FakeAgent(self.keys)
+        agent.sign_event = asyncio.Event()
+
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        payload = self._sign_request(self.allowed_key.public_data)
+        agent_filter.data_received(UInt32(len(payload)) + payload)
+
+        await asyncio.sleep(0.1)
+
+        agent_filter.close()
+        agent_filter.close()
+
+        self.assertTrue(transport.closed)
+        self.assertFalse(agent_filter._tasks)
+        self.assertEqual(transport.data, b'')
+
+        agent.sign_event.set()
+
+    @asynctest
+    async def test_eof(self):
+        """Test that end of file from the remote end closes the filter"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        self.assertFalse(agent_filter.eof_received())
+        self.assertTrue(transport.closed)
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_eof_with_pending_request(self):
+        """Test that end of file waits for outstanding requests"""
+
+        agent = _FakeAgent(self.keys)
+        agent.sign_event = asyncio.Event()
+
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        payload = self._sign_request(self.allowed_key.public_data)
+        agent_filter.data_received(UInt32(len(payload)) + payload)
+
+        await asyncio.sleep(0.1)
+
+        self.assertFalse(agent_filter.eof_received())
+        self.assertFalse(transport.closed)
+
+        agent.sign_event.set()
+
+        resptype, _, _ = await self._wait_response(transport, 0)
+        self.assertEqual(resptype, SSH_AGENT_SIGN_RESPONSE)
+
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+
+            if transport.closed:
+                break
+
+        self.assertTrue(transport.closed)
+
+    @asynctest
+    async def test_connection_lost(self):
+        """Test that a channel close shuts down the filter"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        agent_filter.connection_lost(None)
+
+        self.assertTrue(transport.closed)
+
+        agent_filter.close()
+
+    @asynctest
+    async def test_write_error(self):
+        """Test that a channel write error closes the filter"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, _ = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        transport = _FailingChannelTransport(BrokenPipeError())
+        agent_filter.connection_made(transport)
+
+        payload = Byte(SSH_AGENTC_REQUEST_IDENTITIES)
+        agent_filter.data_received(UInt32(len(payload)) + payload)
+
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(transport.closed)
+
+    @asynctest
+    async def test_unexpected_task_error(self):
+        """Test that an unexpected request error closes the filter"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, _ = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        transport = _FailingChannelTransport(ValueError())
+        agent_filter.connection_made(transport)
+
+        payload = Byte(SSH_AGENTC_REQUEST_IDENTITIES)
+        agent_filter.data_received(UInt32(len(payload)) + payload)
+
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(transport.closed)
+
+    @asynctest
+    async def test_process_frame_after_close(self):
+        """Test that frames received after close are ignored"""
+
+        agent = _FakeAgent(self.keys)
+        agent_filter, transport = await self._start_filter(
+            agent, [self.allowed_key.public_data])
+
+        agent_filter.close()
+
+        await agent_filter._process_frame(Byte(SSH_AGENTC_REQUEST_IDENTITIES))
+
+        self.assertEqual(transport.data, b'')
+
+    @asynctest
+    async def test_connection_failed(self):
+        """Test failure to connect to the SSH agent"""
+
+        agent_filter = asyncssh.SSHAgentForwardingFilter(
+            'fake_agent', [self.allowed_key.public_data])
+
+        with self.assertRaises(OSError):
+            await agent_filter.connect()
