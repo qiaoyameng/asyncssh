@@ -2053,6 +2053,142 @@ class _TestSFTP(_CheckSFTP):
         finally:
             remove('dir')
 
+    @asynctest
+    async def test_path_encoding_sessions_are_independent(self):
+        """Test concurrent SFTP sessions using different path encodings"""
+
+        gbk_name = '目录'.encode('gbk')
+        utf8_name = '目录'.encode('utf-8')
+
+        try:
+            os.mkdir('gbk_dir')
+            os.mkdir('utf8_dir')
+            open(os.path.join(b'gbk_dir', gbk_name), 'wb').close()
+            open(os.path.join(b'utf8_dir', utf8_name), 'wb').close()
+
+            async with self.connect() as gbk_conn:
+                async with self.connect() as utf8_conn:
+                    async with gbk_conn.start_sftp_client(
+                            path_encoding='gbk') as gbk_sftp:
+                        async with utf8_conn.start_sftp_client(
+                                path_encoding='utf-8') as utf8_sftp:
+                            barrier = asyncio.Barrier(2)
+
+                            async def list_gbk():
+                                await barrier.wait()
+                                return await gbk_sftp.listdir('gbk_dir')
+
+                            async def list_utf8():
+                                await barrier.wait()
+                                return await utf8_sftp.listdir('utf8_dir')
+
+                            gbk_names, utf8_names = await asyncio.gather(
+                                list_gbk(), list_utf8())
+
+            self.assertIn('目录', gbk_names)
+            self.assertIn('目录', utf8_names)
+        finally:
+            remove('gbk_dir utf8_dir')
+
+    @asynctest
+    async def test_path_encoding_strict_and_raw_modes(self):
+        """Test strict decoding and retaining undecodable path bytes"""
+
+        gbk_name = '目录'.encode('gbk')
+        invalid_name = b'\xff'
+
+        try:
+            os.mkdir('dir')
+            open(os.path.join(b'dir', gbk_name), 'wb').close()
+            open(os.path.join(b'dir', invalid_name), 'wb').close()
+            os.symlink(b'target', b'dir/badlink' + gbk_name)
+            os.symlink(b'target', b'dir/badlink\xff')
+
+            async with self.connect() as conn:
+                async with conn.start_sftp_client(
+                        path_encoding='gbk') as sftp:
+                    with self.assertRaises(SFTPBadMessage):
+                        await sftp.listdir('dir')
+
+                    with self.assertRaises(SFTPNoSuchFile) as exc_info:
+                        await sftp.rmtree('dir/badlink目录')
+
+                    self.assertIn('目录', str(exc_info.exception))
+
+                async with conn.start_sftp_client(
+                        path_encoding=None) as sftp:
+                    names = await sftp.listdir(b'dir')
+                    names_sftp = await sftp.readdir(b'dir')
+
+                    with self.assertRaises(SFTPNoSuchFile) as exc_info:
+                        await sftp.rmtree(b'dir/badlink\xff')
+
+                    self.assertIn("b'dir/badlink\\xff'",
+                                  str(exc_info.exception))
+
+            self.assertIn(invalid_name, names)
+            self.assertIn(gbk_name, names)
+
+            raw_names = {name.filename: name.longname for name in
+                         names_sftp}
+            self.assertIsInstance(raw_names[invalid_name], bytes)
+            self.assertIn(repr(invalid_name),
+                          raw_names[invalid_name].decode(
+                              'utf-8', 'backslashreplace'))
+        finally:
+            remove('dir')
+
+    @asynctest
+    async def test_path_encoding_links_and_realpath(self):
+        """Test path encoding for link targets and canonical paths"""
+
+        if not self._symlink_supported: # pragma: no cover
+            raise unittest.SkipTest('symlink not available')
+
+        gbk_target = '目标'.encode('gbk')
+
+        try:
+            open(gbk_target, 'wb').close()
+            os.symlink(os.path.join(os.getcwdb(), gbk_target),
+                       b'link')
+
+            async with self.connect() as conn:
+                async with conn.start_sftp_client(
+                        path_encoding='gbk') as sftp:
+                    target = await sftp.readlink('link')
+                    canonical = await sftp.realpath('link')
+                    raw_target = await sftp.readlink(b'link')
+
+            self.assertEqual(target, os.path.join(os.getcwd(), '目标'))
+            self.assertEqual(canonical, os.path.join(os.getcwd(), '目标'))
+            self.assertEqual(raw_target,
+                             os.path.join(os.getcwdb(), gbk_target))
+        finally:
+            remove('link')
+            try:
+                os.remove(gbk_target)
+            except OSError:
+                pass
+
+    @asynctest
+    async def test_non_utf8_path_encoding_rejected_with_sftp_v4(self):
+        """Test non-UTF-8 path encodings are rejected for SFTPv4"""
+
+        async with self.connect() as conn:
+            with self.assertRaises(SFTPBadMessage):
+                async with conn.start_sftp_client(
+                        sftp_version=4, path_encoding='gbk'):
+                    pass
+
+    @asynctest
+    async def test_lossy_path_errors_rejected(self):
+        """Test lossy path error handling is rejected"""
+
+        async with self.connect() as conn:
+            with self.assertRaises(ValueError):
+                async with conn.start_sftp_client(path_errors='replace'):
+                    pass
+
     @sftp_test
     async def test_mkdir(self, sftp):
         """Test creating a directory"""

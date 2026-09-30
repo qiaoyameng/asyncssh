@@ -154,7 +154,7 @@ from .session import SSHTCPSession, SSHUNIXSession, SSHTunTapSession
 from .session import SSHClientSessionFactory, SSHTCPSessionFactory
 from .session import SSHUNIXSessionFactory, SSHTunTapSessionFactory
 
-from .sftp import MIN_SFTP_VERSION, SFTPClient, SFTPServer
+from .sftp import MIN_SFTP_VERSION, SFTPClient, SFTPServer, _SFTPPathCodec
 from .sftp import start_sftp_client
 
 from .stream import SSHReader, SSHWriter, SFTPServerFactory
@@ -5770,8 +5770,9 @@ class SSHClientConnection(SSHConnection):
     async def start_sftp_client(self, env: DefTuple[Optional[Env]] = (),
                                 send_env: DefTuple[Optional[EnvSeq]] = (),
                                 path_encoding: Optional[str] = 'utf-8',
-                                path_errors = 'strict',
-                                sftp_version = MIN_SFTP_VERSION) -> SFTPClient:
+                                path_errors: str = 'strict',
+                                sftp_version: int = MIN_SFTP_VERSION) -> \
+            SFTPClient:
         """Start an SFTP client
 
            This method is a coroutine which attempts to start a secure
@@ -5781,9 +5782,16 @@ class SSHClientConnection(SSHConnection):
 
            An optional Unicode encoding can be specified for sending and
            receiving pathnames, defaulting to UTF-8 with strict error
-           checking. If an encoding of `None` is specified, pathnames
-           will be left as bytes rather than being converted to & from
-           strings.
+           checking. Pathname decoding is verified to round-trip, so
+           names that cannot be represented will not be converted to
+           different writable paths. If an encoding of `None` is
+           specified, pathnames will be left as bytes rather than being
+           converted to & from strings.
+
+           Non-UTF-8 encodings are only available with SFTP version 3.
+           This setting applies only to path and directory entry names;
+           file contents continue to use the encoding set when a file is
+           opened.
 
            :param env: (optional)
                The environment variables to set for this SFTP session. Keys
@@ -5806,7 +5814,7 @@ class SSHClientConnection(SSHConnection):
                The Unicode encoding to apply when sending and receiving
                remote pathnames
            :param path_errors:
-               The error handling strategy to apply on encode/decode errors
+               Must be `'strict'`, ensuring names remain round-trippable
            :param sftp_version: (optional)
                The maximum version of the SFTP protocol to support, currently
                either 3 or 4, defaulting to 3.
@@ -5822,13 +5830,18 @@ class SSHClientConnection(SSHConnection):
 
         """
 
+        if path_errors != 'strict':
+            raise ValueError('path_errors must be strict')
+
+        _SFTPPathCodec(path_encoding, sftp_version)
+
         writer, reader, _ = await self.open_session(subsystem='sftp',
                                                     env=env, send_env=send_env,
                                                     encoding=None)
 
-        return await start_sftp_client(self, self._loop,
-                                       self._utf8_decode_errors, reader, writer,
-                                       path_encoding, path_errors, sftp_version)
+        return await start_sftp_client(
+            self, self._loop, self._utf8_decode_errors, reader, writer,
+            path_encoding, path_errors, sftp_version)
 
 
 class SSHServerConnection(SSHConnection):

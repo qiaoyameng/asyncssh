@@ -23,6 +23,7 @@
 """SFTP handlers"""
 
 import asyncio
+import codecs
 import errno
 from fnmatch import fnmatch
 import inspect
@@ -232,6 +233,84 @@ class _SFTPGlobProtocol(Protocol):
         """Return names and attributes of the files in a directory"""
 
 
+class _SFTPPathCodec:
+    """Session-local encoder and decoder for SFTP path names"""
+
+    def __init__(self, encoding: Optional[str], sftp_version: int):
+        self._utf8_only = sftp_version >= 4
+
+        if self._utf8_only and encoding is not None and \
+                codecs.lookup(encoding).name != 'utf-8':
+            raise SFTPBadMessage('Non-UTF-8 path encoding cannot be used in '
+                                 f'SFTP version {sftp_version}')
+
+        self._encoding = encoding
+
+    def _check_utf8(self, path: bytes) -> None:
+        """Validate that a wire path uses UTF-8 when required"""
+
+        if self._utf8_only:
+            try:
+                path.decode('utf-8', 'strict')
+            except UnicodeDecodeError:
+                raise SFTPBadMessage('Invalid UTF-8 path name') from None
+
+    def check(self, path: bytes) -> None:
+        """Validate a path supplied to an SFTP request"""
+
+        self._check_utf8(path)
+
+    @property
+    def wants_strings(self) -> bool:
+        """Return whether unqualified path results should be strings"""
+
+        return self._encoding is not None
+
+    def encode(self, path: str) -> bytes:
+        """Encode a path name for an SFTP request"""
+
+        if self._encoding is None:
+            raise SFTPBadMessage('Path must be bytes when encoding is not set')
+
+        try:
+            path_bytes = path.encode(self._encoding, 'strict')
+        except UnicodeEncodeError:
+            raise SFTPBadMessage('Unable to encode name') from None
+
+        self._check_utf8(path_bytes)
+        return path_bytes
+
+    def decode(self, path: bytes, want_string: bool = True) -> BytesOrStr:
+        """Decode a path name from an SFTP response"""
+
+        self._check_utf8(path)
+
+        if want_string:
+            if self._encoding is None:
+                raise SFTPBadMessage('Path must be bytes when encoding is '
+                                     'not set')
+
+            try:
+                result = path.decode(self._encoding, 'strict')
+            except UnicodeDecodeError:
+                raise SFTPBadMessage('Unable to decode name') from None
+
+            if result.encode(self._encoding, 'strict') != path:
+                raise SFTPBadMessage('Unable to decode name')
+
+            return result
+
+        return path
+
+    def display(self, path: bytes) -> str:
+        """Return a path name suitable for inclusion in an error message"""
+
+        if self._encoding is None:
+            return repr(path)
+
+        return path.decode(self._encoding, 'backslashreplace')
+
+
 class SFTPFileProtocol(Protocol):
     """Protocol for accessing a file via an SFTP server"""
 
@@ -270,6 +349,9 @@ class _SFTPFSProtocol(Protocol):
 
     def encode(self, path: _SFTPPath) -> bytes:
         """Encode path name using configured path encoding"""
+
+    def display_path(self, path: bytes) -> str:
+        """Return a path name for display in an error message"""
 
     def compose_path(self, path: bytes,
                      parent: Optional[bytes] = None) -> bytes:
@@ -3845,11 +3927,9 @@ class SFTPClient:
 
     """
 
-    def __init__(self, handler: SFTPClientHandler,
-                 path_encoding: Optional[str], path_errors: str):
+    def __init__(self, handler: SFTPClientHandler, path_codec: _SFTPPathCodec):
         self._handler = handler
-        self._path_encoding = path_encoding
-        self._path_errors = path_errors
+        self._path_codec = path_codec
         self._cwd: Optional[bytes] = None
 
     async def __aenter__(self) -> Self:
@@ -3907,11 +3987,9 @@ class SFTPClient:
             path = str(path)
 
         if isinstance(path, str):
-            if self._path_encoding:
-                path = path.encode(self._path_encoding, self._path_errors)
-            else:
-                raise SFTPBadMessage('Path must be bytes when '
-                                     'encoding is not set')
+            path = self._path_codec.encode(path)
+        else:
+            self._path_codec.check(path)
 
         return path
 
@@ -3922,13 +4000,12 @@ class SFTPClient:
 
         """
 
-        if want_string and self._path_encoding:
-            try:
-                return path.decode(self._path_encoding, self._path_errors)
-            except UnicodeDecodeError:
-                raise SFTPBadMessage('Unable to decode name') from None
+        return self._path_codec.decode(path, want_string)
 
-        return path
+    def display_path(self, path: bytes) -> str:
+        """Return a path name for display using this session's encoding"""
+
+        return self._path_codec.display(path)
 
     def compose_path(self, path: _SFTPPath,
                      parent: Optional[bytes] = None) -> bytes:
@@ -3981,8 +4058,7 @@ class SFTPClient:
                     exc = SFTPFileIsADirectory if self.version >= 6 \
                         else SFTPFailure
 
-                    raise exc(srcpath.decode('utf-8', 'backslashreplace') +
-                              ' is a directory')
+                    raise exc(srcfs.display_path(srcpath) + ' is a directory')
 
                 self.logger.info('  Starting copy of directory %s to %s',
                                  srcpath, dstpath)
@@ -4127,8 +4203,7 @@ class SFTPClient:
             assert dstpath is not None
             exc = SFTPNotADirectory if self.version >= 6 else SFTPFailure
 
-            raise exc(dstpath.decode('utf-8', 'backslashreplace') +
-                      ' must be a directory')
+            raise exc(dstfs.display_path(dstpath) + ' must be a directory')
 
         for srcname in srcnames:
             srcfile = cast(bytes, srcname.filename)
@@ -4659,9 +4734,15 @@ class SFTPClient:
             new_matches = await glob.match(self.encode(pattern),
                                            error_handler, self.version)
 
-            if isinstance(pattern, (str, PurePath)):
-                for name in new_matches:
-                    name.filename = self.decode(cast(bytes, name.filename))
+            want_string = isinstance(pattern, (str, PurePath))
+
+            for name in new_matches:
+                name.filename = self.decode(cast(bytes, name.filename),
+                                            want_string)
+
+                if name.longname is not None:
+                    name.longname = self.decode(cast(bytes, name.longname),
+                                                want_string)
 
             matches.extend(new_matches)
 
@@ -4713,7 +4794,7 @@ class SFTPClient:
                 filetype = await self._type(curpath)
 
                 if filetype != FILEXFER_TYPE_DIRECTORY:
-                    curpath_str = curpath.decode('utf-8', 'backslashreplace')
+                    curpath_str = self.display_path(curpath)
 
                     exc = SFTPNotADirectory if self.version >= 6 \
                         else SFTPFailure
@@ -4726,8 +4807,7 @@ class SFTPClient:
         if exists and not exist_ok:
             exc = SFTPFileAlreadyExists if self.version >= 6 else SFTPFailure
 
-            raise exc(curpath.decode('utf-8', 'backslashreplace') +
-                      ' already exists')
+            raise exc(self.display_path(curpath) + ' already exists')
 
     async def rmtree(self, path: _SFTPPath, ignore_errors: bool = False,
                      onerror: _SFTPOnErrorHandler = None) -> None:
@@ -4825,7 +4905,7 @@ class SFTPClient:
 
         try:
             if await self.islink(path):
-                raise SFTPNoSuchFile(path.decode('utf-8', 'backslashreplace') +
+                raise SFTPNoSuchFile(self.display_path(path) +
                                      ' must not be a symlink')
         except SFTPError:
             onerror(self.islink, path, sys.exc_info())
@@ -5600,13 +5680,15 @@ class SFTPClient:
                 names, at_end = await self._handler.readdir(handle)
 
                 for entry in names:
-                    if isinstance(path, (str, PurePath)):
-                        entry.filename = \
-                            self.decode(cast(bytes, entry.filename))
+                    want_string = isinstance(path, (str, PurePath))
 
-                        if entry.longname is not None:
-                            entry.longname = \
-                                self.decode(cast(bytes, entry.longname))
+                    entry.filename = self.decode(cast(bytes, entry.filename),
+                                                 want_string)
+
+                    if entry.longname is not None:
+                        entry.longname = \
+                            self.decode(cast(bytes, entry.longname),
+                                        want_string)
 
                     yield entry
         except SFTPEOFError:
@@ -5776,7 +5858,7 @@ class SFTPClient:
             if self.version < 6:
                 try:
                     names[0].attrs = await self._handler.stat(
-                        self.encode(names[0].filename),
+                        self.encode(cast(_SFTPPath, names[0].filename)),
                         _valid_attr_flags[self.version])
                 except SFTPError:
                     if check == FXRP_STAT_IF_EXISTS:
@@ -5784,11 +5866,11 @@ class SFTPClient:
                     else:
                         raise
 
-            names[0].filename =  self.decode(cast(bytes, names[0].filename),
-                                             isinstance(path, (str, PurePath)))
+            names[0].filename = self.decode(cast(bytes, names[0].filename),
+                                            isinstance(path, (str, PurePath)))
 
             if names[0].longname is not None:
-                names[0].longname =  \
+                names[0].longname = \
                     self.decode(cast(bytes, names[0].longname),
                                 isinstance(path, (str, PurePath)))
 
@@ -5810,7 +5892,7 @@ class SFTPClient:
         if self._cwd is None:
             self._cwd = await self.realpath(b'.')
 
-        return self.decode(self._cwd)
+        return self.decode(self._cwd, self._path_codec.wants_strings)
 
     async def chdir(self, path: _SFTPPath) -> None:
         """Change the current remote working directory
@@ -8043,6 +8125,13 @@ class LocalFS:
 
         return os.fsencode(path)
 
+    def display_path(self, path: bytes) -> str:
+        """Return a local path name for display in an error message"""
+
+        # pylint: disable=no-self-use
+
+        return repr(path)
+
     def compose_path(self, path: bytes,
                      parent: Optional[bytes] = None) -> bytes:
         """Compose a path
@@ -8277,18 +8366,37 @@ async def start_sftp_client(conn: 'SSHClientConnection',
                             path_errors: str, sftp_version: int) -> SFTPClient:
     """Start an SFTP client"""
 
-    handler = SFTPClientHandler(loop, utf8_decode_errors,
-                                reader, writer, sftp_version)
+    if path_errors != 'strict':
+        raise ValueError('path_errors must be strict')
 
-    handler.logger.info('Starting SFTP client')
+    handler: Optional[SFTPClientHandler] = None
 
-    await handler.start()
+    try:
+        path_codec = _SFTPPathCodec(path_encoding, sftp_version)
 
-    conn.create_task(handler.recv_packets(), handler.logger)
+        handler = SFTPClientHandler(loop, utf8_decode_errors,
+                                    reader, writer, sftp_version)
 
-    await handler.request_limits()
+        handler.logger.info('Starting SFTP client')
 
-    return SFTPClient(handler, path_encoding, path_errors)
+        await handler.start()
+
+        conn.create_task(handler.recv_packets(), handler.logger)
+
+        await handler.request_limits()
+
+        if handler.version != sftp_version:
+            path_codec = _SFTPPathCodec(path_encoding, handler.version)
+    except Exception:
+        if handler is not None:
+            await handler._cleanup(SFTPBadMessage('Unsupported SFTP path '
+                                                  'encoding'))
+        else:
+            writer.close()
+
+        raise
+
+    return SFTPClient(handler, path_codec)
 
 
 async def _sftp_handler(sftp_server: MaybeAwait[SFTPServer],
