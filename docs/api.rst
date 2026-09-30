@@ -1532,6 +1532,10 @@ SSH agent forwarding may be enabled when making outbound SSH connections
 by specifying the ``agent_forwarding`` argument when calling
 :func:`create_connection`, allowing processes running on the server
 to tunnel requests back over the SSH connection to the client's ssh-agent.
+When ``agent_forward_identities`` is also set, AsyncSSH exposes only
+those identities and permits signature requests only for them. Other
+agent operations are rejected after complete message validation, so
+split or coalesced messages cannot bypass the restriction.
 
 Agent forwarding can be enabled when starting an SSH server by
 specifying the ``agent_forwarding`` argument when calling

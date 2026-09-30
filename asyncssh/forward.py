@@ -21,13 +21,16 @@
 """SSH port forwarding handlers"""
 
 import asyncio
+from collections import deque
 import socket
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Deque, Dict
+from typing import Optional, Sequence, Tuple
 from typing import Type, cast
 from typing_extensions import Self
 
 from .misc import ChannelOpenError, SockAddr
+from .packet import Byte, PacketDecodeError, SSHPacket, String, UInt32
 
 
 if TYPE_CHECKING:
@@ -36,6 +39,15 @@ if TYPE_CHECKING:
 
 
 SSHForwarderCoro = Callable[..., Awaitable]
+
+SSH_AGENTC_REQUEST_IDENTITIES = 11
+SSH_AGENTC_SIGN_REQUEST = 13
+
+SSH_AGENT_FAILURE = 5
+SSH_AGENT_IDENTITIES_ANSWER = 12
+SSH_AGENT_SIGN_RESPONSE = 14
+
+SSH_AGENT_MAX_MESSAGE_SIZE = 256 * 1024
 
 
 class SSHForwarder(asyncio.BaseProtocol):
@@ -187,6 +199,227 @@ class SSHForwarder(asyncio.BaseProtocol):
             peer = self._peer
             self._peer = None
             peer.close()
+
+
+class SSHRestrictedAgentForwarder(SSHForwarder):
+    """Restricted SSH agent forwarding connection handler"""
+
+    def __init__(self, identities: Sequence[bytes],
+                 peer: Optional[SSHForwarder] = None):
+        super().__init__(peer)
+
+        self._identities = set(identities)
+        self._request_buf = b''
+        self._response_buf = b''
+        self._request_queue: Deque[bytes] = deque()
+        self._outstanding_request: Optional[int] = None
+
+    @staticmethod
+    def _get_frame(buf: bytes) -> Tuple[Optional[bytes], bytes]:
+        """Extract one complete SSH agent message from a buffer"""
+
+        if len(buf) < 4:
+            return None, buf
+
+        msglen = int.from_bytes(buf[:4], 'big')
+
+        if not 1 <= msglen <= SSH_AGENT_MAX_MESSAGE_SIZE or \
+                len(buf) < 4 + msglen:
+            if msglen > SSH_AGENT_MAX_MESSAGE_SIZE or msglen == 0:
+                raise PacketDecodeError('Invalid SSH agent message length')
+
+            return None, buf
+
+        return buf[:4 + msglen], buf[4 + msglen:]
+
+    def _denied(self) -> bytes:
+        """Return an SSH agent failure message"""
+
+        payload = Byte(SSH_AGENT_FAILURE)
+        return UInt32(len(payload)) + payload
+
+    def _check_request(self, frame: bytes) -> bool:
+        """Validate a request and determine whether it may be forwarded"""
+
+        packet = SSHPacket(frame[4:])
+        msgtype = packet.get_byte()
+
+        if msgtype == SSH_AGENTC_REQUEST_IDENTITIES:
+            packet.check_end()
+            return True
+        elif msgtype == SSH_AGENTC_SIGN_REQUEST:
+            key_blob = packet.get_string()
+            packet.get_string()
+            packet.get_uint32()
+            packet.check_end()
+
+            return key_blob in self._identities
+        else:
+            return False
+
+    def _filter_identities(self, frame: bytes) -> bytes:
+        """Return only the authorized identities in an agent response"""
+
+        packet = SSHPacket(frame[4:])
+        msgtype = packet.get_byte()
+
+        if msgtype == SSH_AGENT_FAILURE:
+            packet.check_end()
+            return frame
+
+        if msgtype != SSH_AGENT_IDENTITIES_ANSWER:
+            raise PacketDecodeError('Unexpected SSH agent response')
+
+        requested_keys = packet.get_uint32()
+        identities = b''
+        num_keys = 0
+
+        for _ in range(requested_keys):
+            key_blob = packet.get_string()
+            comment = packet.get_string()
+
+            if key_blob in self._identities:
+                identities += String(key_blob) + String(comment)
+                num_keys += 1
+
+        packet.check_end()
+
+        payload = Byte(SSH_AGENT_IDENTITIES_ANSWER) + UInt32(num_keys) + \
+            identities
+        return UInt32(len(payload)) + payload
+
+    def _check_response(self, frame: bytes) -> bytes:
+        """Validate and, where necessary, filter an agent response"""
+
+        assert self._outstanding_request is not None
+
+        packet = SSHPacket(frame[4:])
+        msgtype = packet.get_byte()
+
+        if msgtype == SSH_AGENT_FAILURE:
+            packet.check_end()
+        elif self._outstanding_request == SSH_AGENTC_REQUEST_IDENTITIES:
+            frame = self._filter_identities(frame)
+        elif self._outstanding_request == SSH_AGENTC_SIGN_REQUEST:
+            if msgtype != SSH_AGENT_SIGN_RESPONSE:
+                raise PacketDecodeError('Unexpected SSH agent response')
+
+            packet.get_string()
+            packet.check_end()
+        else: # pragma: no cover
+            raise PacketDecodeError('Unexpected SSH agent response')
+
+        return frame
+
+    def _send_next(self) -> None:
+        """Send the next queued request, returning local failures inline"""
+
+        try:
+            while self._request_queue and self._outstanding_request is None:
+                frame = self._request_queue.popleft()
+                msgtype = frame[4]
+
+                if self._check_request(frame):
+                    self._outstanding_request = msgtype
+
+                    assert self._peer is not None
+                    self.pause_reading()
+                    self._peer.write(frame)
+                else:
+                    SSHForwarder.write(self, self._denied())
+        except PacketDecodeError:
+            self.close()
+
+    def _request_data_received(self, data: bytes) -> None:
+        """Parse complete agent requests before forwarding them"""
+
+        self._request_buf += data
+
+        try:
+            while self._request_buf:
+                frame, self._request_buf = self._get_frame(self._request_buf)
+
+                if frame is None:
+                    break
+
+                self._request_queue.append(frame)
+        except PacketDecodeError:
+            self.close()
+            return
+
+        self._send_next()
+
+    def _response_data_received(self, data: bytes) -> None:
+        """Validate complete agent responses before delivering them"""
+
+        if self._outstanding_request is None:
+            self.close()
+            return
+
+        self._response_buf += data
+
+        try:
+            frame, self._response_buf = self._get_frame(self._response_buf)
+
+            if frame is None:
+                return
+
+            if self._response_buf:
+                raise PacketDecodeError('Unexpected SSH agent message')
+
+            frame = self._check_response(frame)
+        except PacketDecodeError:
+            self.close()
+            return
+
+        outstanding_request = self._outstanding_request
+        self._outstanding_request = None
+        SSHForwarder.write(self, frame)
+
+        if self._transport:
+            try:
+                self.resume_reading()
+            except OSError: # pragma: no cover
+                self.close()
+                return
+
+        self._send_next()
+
+        if outstanding_request is not None and self._eof_received and \
+                not self._request_queue and self._outstanding_request is None:
+            self.write_eof()
+
+    def data_received(self, data: bytes, datatype: Optional[int] = None) \
+            -> None:
+        """Handle data from the remote agent client"""
+
+        # pylint: disable=unused-argument
+
+        self._request_data_received(data)
+
+    def write(self, data: bytes) -> None:
+        """Handle data received from the local SSH agent"""
+
+        self._response_data_received(data)
+
+    def write_eof(self) -> None:
+        """Handle EOF received from the local SSH agent"""
+
+        if self._outstanding_request is not None or self._request_queue or \
+                self._request_buf:
+            self.close()
+        else:
+            super().write_eof()
+
+    def eof_received(self) -> bool:
+        """Handle EOF received from the remote agent client"""
+
+        if self._outstanding_request is not None or self._request_queue or \
+                self._request_buf:
+            self.close()
+            return True
+
+        return super().eof_received()
 
 
 class SSHLocalForwarder(SSHForwarder):

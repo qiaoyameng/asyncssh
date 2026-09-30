@@ -85,7 +85,7 @@ from .encryption import get_default_encryption_algs
 from .encryption import encryption_needs_mac
 from .encryption import get_encryption_params, get_encryption
 
-from .forward import SSHForwarder
+from .forward import SSHForwarder, SSHRestrictedAgentForwarder
 
 from .gss import GSSBase, GSSClient, GSSServer, GSSError
 
@@ -3229,6 +3229,26 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         return SSHForwarder(cast(SSHForwarder, peer))
 
+    async def forward_restricted_agent_connection(
+            self, dest_path: str,
+            identities: Sequence[bytes]) -> SSHRestrictedAgentForwarder:
+        """Forward a restricted SSH agent connection"""
+
+        agent_forwarder = SSHRestrictedAgentForwarder(identities)
+
+        try:
+            _, peer = await self._loop.create_unix_connection(
+                lambda: SSHForwarder(agent_forwarder), dest_path)
+
+            self.logger.info('  Forwarding restricted agent connection '
+                             'to %s', dest_path)
+        except OSError as exc:
+            agent_forwarder.close()
+            raise ChannelOpenError(OPEN_CONNECT_FAILED, str(exc)) from None
+
+        agent_forwarder.set_peer(cast(SSHForwarder, peer))
+        return agent_forwarder
+
     async def forward_unix_connection(self, dest_path: str) -> SSHForwarder:
         """Forward a tunneled UNIX domain socket connection
 
@@ -3497,6 +3517,7 @@ class SSHClientConnection(SSHConnection):
 
         self._agent_identities = options.agent_identities
         self._agent_forward_path = options.agent_forward_path
+        self._agent_forward_identities = options.agent_forward_identities
         self._get_agent_keys = bool(self._agent)
 
         self._pkcs11_provider = options.pkcs11_provider
@@ -4138,6 +4159,12 @@ class SSHClientConnection(SSHConnection):
 
         if self._agent_forward_path:
             self.logger.info('Accepted SSH agent connection')
+
+            if self._agent_forward_identities is not None:
+                return (self.create_unix_channel(),
+                        self.forward_restricted_agent_connection(
+                            self._agent_forward_path,
+                            self._agent_forward_identities))
 
             return (self.create_unix_channel(),
                     self.forward_unix_connection(self._agent_forward_path))
@@ -7827,6 +7854,13 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
            agent requests should be sent to a different path than client
            agent requests. By default, forwarding ssh-agent requests from
            the server is not allowed.
+       :param agent_forward_identities: (optional)
+           A list of public key identities allowed on a forwarded
+           ssh-agent connection. Requests are inspected as complete
+           messages, only identity listing and signing are permitted,
+           and signing is limited to these identities. An empty sequence
+           enables restricted forwarding with no identities. By default,
+           forwarding remains unrestricted when `agent_forwarding` is on.
        :param pkcs11_provider: (optional)
            The path of a shared library which should be used as a PKCS#11
            provider for accessing keys on PIV security tokens. By default,
@@ -8067,6 +8101,8 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
        :type agent_identities:
            *see* :ref:`SpecifyingPublicKeys` and :ref:`SpecifyingCertificates`
        :type agent_forwarding: `bool` or `str`
+       :type agent_forward_identities:
+           *see* :ref:`SpecifyingPublicKeys` and :ref:`SpecifyingCertificates`
        :type pkcs11_provider: `str` or `None`
        :type pkcs11_pin: `str`
        :type client_version: `str`
@@ -8136,6 +8172,7 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
     agent_path: Optional[str]
     agent_identities: Optional[Sequence[bytes]]
     agent_forward_path: Optional[str]
+    agent_forward_identities: Optional[Sequence[bytes]]
     pkcs11_provider: Optional[str]
     pkcs11_pin: Optional[str]
     command: Optional[str]
@@ -8211,6 +8248,8 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
                 agent_path: DefTuple[Optional[str]] = (),
                 agent_identities: DefTuple[Optional[IdentityListArg]] = (),
                 agent_forwarding: DefTuple[Union[bool, str]] = (),
+                agent_forward_identities:
+                    DefTuple[Optional[IdentityListArg]] = (),
                 pkcs11_provider: DefTuple[Optional[str]] = (),
                 pkcs11_pin: Optional[str] = None,
                 command: DefTuple[Optional[str]] = (),
@@ -8449,6 +8488,15 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
             self.agent_forward_path = agent_path
         else:
             self.agent_forward_path = agent_forwarding
+
+        if agent_forward_identities is None or \
+                agent_forward_identities == ():
+            self.agent_forward_identities = None
+        else:
+            self.agent_forward_identities = \
+                load_identities(cast(IdentityListArg,
+                                     agent_forward_identities),
+                                True)
 
         self.command = cast(Optional[str], command if command != () else
             config.get('RemoteCommand'))

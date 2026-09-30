@@ -3,6 +3,13 @@
 Change Log
 ==========
 
+Release 2.24.1 (under development)
+----------------------------------
+
+* Added restricted SSH agent forwarding support, allowing forwarded
+  identity listing and signing requests to be limited to explicitly
+  authorized public keys while rejecting all other agent operations.
+
 Release 2.24.0 (27 Jun 2026)
 ----------------------------
 
