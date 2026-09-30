@@ -23,6 +23,7 @@
 """SFTP handlers"""
 
 import asyncio
+import codecs
 import errno
 from fnmatch import fnmatch
 import inspect
@@ -173,6 +174,35 @@ _T = TypeVar('_T')
 
 MIN_SFTP_VERSION = 3
 MAX_SFTP_VERSION = 6
+
+# SFTPv4 and later require path names to be encoded as UTF-8. Only SFTPv3
+# is permitted to use a legacy encoding to interoperate with older devices.
+
+# Error handlers allowed for path name encoding/decoding. "strict" rejects
+# names that can't be represented, and "surrogateescape" preserves the
+# original bytes. Lossy handlers such as "replace" or "ignore" are rejected
+# because they would turn one remote name into a different writable path.
+_ALLOWED_PATH_ERRORS = ('strict', 'surrogateescape')
+
+
+def _validate_path_policy(path_encoding: Optional[str],
+                          path_errors: str,
+                          sftp_version: int) -> None:
+    """Validate a per-session path name encoding policy"""
+
+    if path_errors not in _ALLOWED_PATH_ERRORS:
+        raise ValueError(f'Invalid path error handler {path_errors!r}: '
+                         'must be one of ' +
+                         ', '.join(repr(e) for e in _ALLOWED_PATH_ERRORS))
+
+    if path_encoding is not None and sftp_version >= 4:
+        codec = codecs.lookup(path_encoding)
+
+        if codec.name != 'utf-8':
+            raise ValueError(f'Path encoding {path_encoding!r} violates '
+                             'the SFTPv4+ requirement that path names use '
+                             'UTF-8; use path_encoding="utf-8" or negotiate '
+                             'SFTP version 3')
 
 SAFE_SFTP_READ_LEN = 16*1024                        # 16 KiB
 SAFE_SFTP_WRITE_LEN = 16*1024                       # 16 KiB
@@ -3847,6 +3877,8 @@ class SFTPClient:
 
     def __init__(self, handler: SFTPClientHandler,
                  path_encoding: Optional[str], path_errors: str):
+        _validate_path_policy(path_encoding, path_errors, handler.version)
+
         self._handler = handler
         self._path_encoding = path_encoding
         self._path_errors = path_errors
@@ -3908,10 +3940,26 @@ class SFTPClient:
 
         if isinstance(path, str):
             if self._path_encoding:
-                path = path.encode(self._path_encoding, self._path_errors)
+                try:
+                    path = path.encode(self._path_encoding, self._path_errors)
+                except UnicodeError:
+                    raise SFTPBadMessage(
+                        'Unable to encode path name') from None
             else:
                 raise SFTPBadMessage('Path must be bytes when '
                                      'encoding is not set')
+
+        # SFTPv4 and later require UTF-8 on the wire. Never send a
+        # non-UTF-8 name silently, even when paths are handled as bytes;
+        # reject names which can't be represented in the protocol.
+
+        if self._handler.version >= 4:
+            try:
+                path.decode('utf-8', 'strict')
+            except UnicodeDecodeError:
+                raise SFTPBadMessage(
+                    'Path name is not valid UTF-8, as required by '
+                    'the negotiated SFTP version') from None
 
         return path
 
@@ -3925,10 +3973,28 @@ class SFTPClient:
         if want_string and self._path_encoding:
             try:
                 return path.decode(self._path_encoding, self._path_errors)
-            except UnicodeDecodeError:
+            except UnicodeError:
                 raise SFTPBadMessage('Unable to decode name') from None
 
         return path
+
+    def _display_path(self, path: bytes) -> str:
+        """Return a human-readable form of a path for error messages
+
+           This follows the session's path encoding policy, falling back
+           to escaping undecodable bytes so an error message can never
+           raise while formatting a path. The escaped form is only used
+           for display; the underlying bytes used for file operations are
+           left untouched.
+
+        """
+
+        encoding = self._path_encoding or 'utf-8'
+
+        try:
+            return path.decode(encoding, 'backslashreplace')
+        except LookupError: # pragma: no cover
+            return path.decode('utf-8', 'backslashreplace')
 
     def compose_path(self, path: _SFTPPath,
                      parent: Optional[bytes] = None) -> bytes:
@@ -3981,7 +4047,7 @@ class SFTPClient:
                     exc = SFTPFileIsADirectory if self.version >= 6 \
                         else SFTPFailure
 
-                    raise exc(srcpath.decode('utf-8', 'backslashreplace') +
+                    raise exc(self._display_path(srcpath) +
                               ' is a directory')
 
                 self.logger.info('  Starting copy of directory %s to %s',
@@ -4127,7 +4193,7 @@ class SFTPClient:
             assert dstpath is not None
             exc = SFTPNotADirectory if self.version >= 6 else SFTPFailure
 
-            raise exc(dstpath.decode('utf-8', 'backslashreplace') +
+            raise exc(self._display_path(dstpath) +
                       ' must be a directory')
 
         for srcname in srcnames:
@@ -4713,7 +4779,7 @@ class SFTPClient:
                 filetype = await self._type(curpath)
 
                 if filetype != FILEXFER_TYPE_DIRECTORY:
-                    curpath_str = curpath.decode('utf-8', 'backslashreplace')
+                    curpath_str = self._display_path(curpath)
 
                     exc = SFTPNotADirectory if self.version >= 6 \
                         else SFTPFailure
@@ -4726,7 +4792,7 @@ class SFTPClient:
         if exists and not exist_ok:
             exc = SFTPFileAlreadyExists if self.version >= 6 else SFTPFailure
 
-            raise exc(curpath.decode('utf-8', 'backslashreplace') +
+            raise exc(self._display_path(curpath) +
                       ' already exists')
 
     async def rmtree(self, path: _SFTPPath, ignore_errors: bool = False,
@@ -4825,7 +4891,7 @@ class SFTPClient:
 
         try:
             if await self.islink(path):
-                raise SFTPNoSuchFile(path.decode('utf-8', 'backslashreplace') +
+                raise SFTPNoSuchFile(self._display_path(path) +
                                      ' must not be a symlink')
         except SFTPError:
             onerror(self.islink, path, sys.exc_info())
@@ -8288,7 +8354,12 @@ async def start_sftp_client(conn: 'SSHClientConnection',
 
     await handler.request_limits()
 
-    return SFTPClient(handler, path_encoding, path_errors)
+    try:
+        return SFTPClient(handler, path_encoding, path_errors)
+    except Exception:
+        handler.exit()
+        await handler.wait_closed()
+        raise
 
 
 async def _sftp_handler(sftp_server: MaybeAwait[SFTPServer],

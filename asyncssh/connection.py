@@ -5770,8 +5770,9 @@ class SSHClientConnection(SSHConnection):
     async def start_sftp_client(self, env: DefTuple[Optional[Env]] = (),
                                 send_env: DefTuple[Optional[EnvSeq]] = (),
                                 path_encoding: Optional[str] = 'utf-8',
-                                path_errors = 'strict',
-                                sftp_version = MIN_SFTP_VERSION) -> SFTPClient:
+                                path_errors: str = 'strict',
+                                sftp_version: int = MIN_SFTP_VERSION) -> \
+            SFTPClient:
         """Start an SFTP client
 
            This method is a coroutine which attempts to start a secure
@@ -5779,11 +5780,31 @@ class SSHClientConnection(SSHConnection):
            :class:`SFTPClient` object which can be used to copy and
            access files on the remote host.
 
-           An optional Unicode encoding can be specified for sending and
-           receiving pathnames, defaulting to UTF-8 with strict error
-           checking. If an encoding of `None` is specified, pathnames
-           will be left as bytes rather than being converted to & from
+           An independent path name encoding policy can be configured
+           for this SFTP session, without affecting any other session.
+           By default, path names are encoded using UTF-8 with strict
+           error checking. The ``path_errors`` argument selects how
+           names are handled:
+
+             * ``'strict'`` rejects names which can't be encoded or
+               decoded in ``path_encoding``,
+             * ``'surrogateescape'`` preserves the original bytes of
+               undecodable names, allowing them to be round-tripped
+               back to the server unchanged.
+
+           Lossy handlers such as ``'replace'`` or ``'ignore'`` are not
+           allowed, since they could turn one remote name into a
+           different writable path.
+
+           If an encoding of `None` is specified, path names will be
+           left as bytes rather than being converted to and from
            strings.
+
+           SFTP version 4 and later require path names to be encoded
+           as UTF-8. Selecting any non-UTF-8 ``path_encoding`` when
+           negotiating SFTP version 4 or later raises :exc:`ValueError`
+           rather than silently violating the protocol; legacy device
+           encodings must be used with the default SFTP version 3.
 
            :param env: (optional)
                The environment variables to set for this SFTP session. Keys
@@ -5804,9 +5825,12 @@ class SSHClientConnection(SSHConnection):
                env and send_env, the value from env will be used.
            :param path_encoding:
                The Unicode encoding to apply when sending and receiving
-               remote pathnames
+               remote path names and directory entry names. This does
+               not affect file contents or other protocol strings.
            :param path_errors:
-               The error handling strategy to apply on encode/decode errors
+               The error handling strategy to apply on path name
+               encode/decode errors, either ``'strict'`` or
+               ``'surrogateescape'``
            :param sftp_version: (optional)
                The maximum version of the SFTP protocol to support, currently
                either 3 or 4, defaulting to 3.
@@ -5819,6 +5843,9 @@ class SSHClientConnection(SSHConnection):
            :returns: :class:`SFTPClient`
 
            :raises: :exc:`SFTPError` if the session can't be opened
+           :raises: :exc:`ValueError` if the path encoding policy is
+                    invalid or violates the negotiated SFTP version's
+                    UTF-8 requirement
 
         """
 

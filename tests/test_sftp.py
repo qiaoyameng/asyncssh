@@ -2327,6 +2327,208 @@ class _TestSFTP(_CheckSFTP):
                     await sftp.symlink('file', 'link')
 
     @asynctest
+    async def test_path_encoding_policy(self):
+        """Test per-session path encoding policy validation"""
+
+        async with self.connect() as conn:
+            with self.assertRaises(ValueError):
+                async with conn.start_sftp_client(path_errors='replace'):
+                    pass
+
+            with self.assertRaises(ValueError):
+                async with conn.start_sftp_client(path_errors='ignore'):
+                    pass
+
+            # SFTPv4+ requires UTF-8 path names on the wire
+
+            with self.assertRaises(ValueError):
+                async with conn.start_sftp_client(path_encoding='gbk',
+                                                  sftp_version=4):
+                    pass
+
+            # A legacy encoding is allowed when negotiating SFTPv3
+
+            async with conn.start_sftp_client(path_encoding='gbk',
+                                              sftp_version=3) as sftp:
+                self.assertEqual(sftp.version, 3)
+
+            # UTF-8 remains valid on newer versions
+
+            async with conn.start_sftp_client(path_encoding='utf-8',
+                                              sftp_version=4) as sftp:
+                self.assertEqual(sftp.version, 4)
+
+    @asynctest
+    async def test_path_encoding_strict(self):
+        """Test strict decoding rejects non-GBK directory entry names"""
+
+        # Bytes which are valid GBK but not valid UTF-8
+
+        raw_name = b'legacy-\xc0\xeb'
+
+        with open(raw_name, 'wb') as f:
+            f.write(b'data')
+
+        try:
+            async with self.connect() as conn:
+                async with conn.start_sftp_client(path_encoding='gbk',
+                                                  path_errors='strict') \
+                        as sftp:
+                    names = await sftp.listdir('.')
+                    self.assertIn(raw_name.decode('gbk'), names)
+
+                async with conn.start_sftp_client(path_encoding='utf-8',
+                                                  path_errors='strict') \
+                        as sftp:
+                    with self.assertRaises(SFTPBadMessage):
+                        await sftp.listdir('.')
+        finally:
+            os.remove(raw_name)
+
+    @asynctest
+    async def test_path_encoding_surrogateescape(self):
+        """Test raw bytes are preserved and round-trip exactly"""
+
+        raw_name = b'legacy-\xc0\xeb'
+
+        with open(raw_name, 'wb') as f:
+            f.write(b'data')
+
+        try:
+            async with self.connect() as conn:
+                async with conn.start_sftp_client(path_encoding='gbk',
+                                                  path_errors=
+                                                  'surrogateescape') \
+                        as sftp:
+                    names = await sftp.listdir('.')
+                    decoded = [n for n in names if 'legacy' in n]
+                    self.assertEqual(len(decoded), 1)
+
+                    # The name must encode back to the exact original bytes
+
+                    self.assertEqual(decoded[0].encode('gbk',
+                                                       'surrogateescape'),
+                                     raw_name)
+
+                    # readlink and realpath decode consistently, and the
+                    # results round-trip to the exact original bytes
+
+                    link_raw = b'link-' + raw_name
+                    target_raw = b'/target-' + raw_name
+
+                    with open(b'target-' + raw_name, 'wb') as target_file:
+                        target_file.write(b'data')
+
+                    os.symlink(target_raw, link_raw)
+
+                    try:
+                        link_target = await sftp.readlink(link_raw)
+                        self.assertEqual(link_target.encode(
+                                             'gbk', 'surrogateescape'),
+                                         target_raw)
+
+                        real = await sftp.realpath(link_raw)
+                        self.assertEqual(real.encode(
+                                             'gbk', 'surrogateescape'),
+                                         target_raw)
+                    finally:
+                        os.remove(link_raw)
+                        os.remove(b'target-' + raw_name)
+        finally:
+            os.remove(raw_name)
+
+    @asynctest
+    async def test_path_encoding_v4_non_utf8_write(self):
+        """Test SFTPv4 refuses to write a non-UTF-8 name"""
+
+        raw_name = b'legacy-\xc0\xeb'
+
+        async with self.connect() as conn:
+            async with conn.start_sftp_client(path_encoding='utf-8',
+                                              path_errors='surrogateescape',
+                                              sftp_version=4) as sftp:
+                bad_name = raw_name.decode('utf-8', 'surrogateescape')
+
+                with self.assertRaises(SFTPBadMessage):
+                    await sftp.mkdir(bad_name)
+
+            # Even bytes mode must not silently emit non-UTF-8 names
+
+            async with conn.start_sftp_client(path_encoding=None,
+                                              sftp_version=4) as sftp:
+                with self.assertRaises(SFTPBadMessage):
+                    await sftp.mkdir(raw_name)
+
+    @asynctest
+    async def test_path_encoding_concurrent_no_crosstalk(self):
+        """Test concurrent sessions with different encodings"""
+
+        utf8_name = 'caf\xe9.txt'
+        raw_gbk_name = b'legacy-\xc0\xeb.txt'
+
+        with open(utf8_name, 'wb') as f:
+            f.write(b'utf8')
+
+        with open(raw_gbk_name, 'wb') as f:
+            f.write(b'gbk')
+
+        async def list_with(path_encoding, path_errors):
+            async with self.connect() as conn:
+                async with conn.start_sftp_client(
+                        path_encoding=path_encoding,
+                        path_errors=path_errors) as sftp:
+                    return [n async for n in sftp.scandir('.')
+                            if not n.filename.startswith('.')]
+
+        try:
+            for _ in range(3):
+                utf8_entries, gbk_entries = await asyncio.gather(
+                    list_with('utf-8', 'surrogateescape'),
+                    list_with('gbk', 'surrogateescape'))
+
+                utf8_names = {n.filename for n in utf8_entries}
+                gbk_names = {n.filename for n in gbk_entries}
+
+                self.assertIn(utf8_name, utf8_names)
+                self.assertIn(raw_gbk_name.decode('gbk'), gbk_names)
+
+                # Names must be re-encodable to their exact original bytes
+
+                gbk_legacy = next(n for n in gbk_names
+                                  if n.startswith('legacy'))
+                self.assertEqual(
+                    gbk_legacy.encode('gbk', 'surrogateescape'),
+                    raw_gbk_name)
+
+                # Each session kept its own decoding policy
+
+                self.assertNotEqual(
+                    {n.encode('utf-8', 'surrogateescape')
+                     for n in utf8_names if 'legacy' in n},
+                    {n.encode('gbk', 'surrogateescape')
+                     for n in gbk_names if 'legacy' in n})
+        finally:
+            os.remove(utf8_name)
+            os.remove(raw_gbk_name)
+
+    @asynctest
+    async def test_path_encoding_exception_path(self):
+        """Test error messages display paths using the session policy"""
+
+        self._create_file('plain-file')
+
+        async with self.connect() as conn:
+            async with conn.start_sftp_client(path_encoding='gbk',
+                                              path_errors=
+                                              'surrogateescape') as sftp:
+                with self.assertRaises(SFTPError) as cm:
+                    await sftp.makedirs(b'plain-file/sub')
+
+                self.assertIn('plain-file', str(cm.exception))
+
+        remove('plain-file')
+
+    @asynctest
     async def test_nonstandard_symlink_client(self):
         """Test creating a symlink with opposite argument order"""
 
