@@ -146,6 +146,7 @@ Main Functions
 
 .. autofunction:: connect
 .. autofunction:: connect_reverse
+.. autofunction:: connect_jump
 .. autofunction:: listen
 .. autofunction:: listen_reverse
 .. autofunction:: run_client
@@ -158,6 +159,8 @@ Main Functions
 
 Main Classes
 ============
+
+.. autoclass:: SSHJumpHop
 
 .. autoclass:: SSHClient
 
@@ -2021,6 +2024,7 @@ Exceptions
 .. autoexception:: CompressionError
 .. autoexception:: ConnectionLost
 .. autoexception:: HostKeyNotVerifiable
+.. autoexception:: SSHJumpError
 .. autoexception:: IllegalUserName
 .. autoexception:: KeyExchangeFailed
 .. autoexception:: MACError

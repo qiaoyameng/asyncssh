@@ -51,6 +51,8 @@ from .connection import get_server_auth_methods, run_client, run_server
 
 from .editor import SSHLineEditorChannel
 
+from .jump import SSHJumpError, SSHJumpHop, connect_jump
+
 from .known_hosts import SSHKnownHosts
 from .known_hosts import import_known_hosts, read_known_hosts
 from .known_hosts import match_known_hosts
