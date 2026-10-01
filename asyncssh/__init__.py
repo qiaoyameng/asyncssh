@@ -49,6 +49,8 @@ from .connection import create_connection, create_server, connect, listen
 from .connection import connect_reverse, listen_reverse, get_server_host_key
 from .connection import get_server_auth_methods, run_client, run_server
 
+from .chain import SSHChainError, SSHChainHop, connect_chain
+
 from .editor import SSHLineEditorChannel
 
 from .known_hosts import SSHKnownHosts
@@ -149,6 +151,7 @@ __all__ = [
     'SFTPServer', 'SFTPServerFactory', 'SFTPUnknownPrincipal', 'SFTPVFSAttrs',
     'SFTPWriteProtect', 'SSHAcceptHandler', 'SSHAcceptor', 'SSHAgentClient',
     'SSHAgentKeyPair', 'SSHAuthorizedKeys', 'SSHCertificate', 'SSHClient',
+    'SSHChainError', 'SSHChainHop',
     'SSHClientChannel', 'SSHClientConnection', 'SSHClientConnectionOptions',
     'SSHClientProcess', 'SSHClientSession', 'SSHCompletedProcess',
     'SSHForwarder', 'SSHKey', 'SSHKeyPair', 'SSHKnownHosts',
@@ -162,7 +165,8 @@ __all__ = [
     'SSHTCPSession', 'SSHTunTapChannel', 'SSHTunTapSession',
     'SSHUNIXChannel', 'SSHUNIXSession', 'SSHWriter',
     'STDOUT', 'ServiceNotAvailable', 'SignalReceived', 'TerminalSizeChanged',
-    'TimeoutError', 'connect', 'connect_agent', 'connect_reverse',
+    'TimeoutError', 'connect', 'connect_agent', 'connect_chain',
+    'connect_reverse',
     'create_connection', 'create_server', 'create_sshsig',
     'generate_private_key', 'get_server_auth_methods', 'get_server_host_key',
     'import_authorized_keys', 'import_certificate', 'import_known_hosts',

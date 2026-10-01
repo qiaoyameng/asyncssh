@@ -145,6 +145,7 @@ Main Functions
 ==============
 
 .. autofunction:: connect
+.. autofunction:: connect_chain
 .. autofunction:: connect_reverse
 .. autofunction:: listen
 .. autofunction:: listen_reverse
@@ -412,6 +413,12 @@ Connection Classes
 .. autoclass:: SSHClientConnectionOptions()
 
 .. autoclass:: SSHServerConnectionOptions()
+
+.. autoclass:: SSHChainHop()
+
+   =========================== =
+   .. automethod:: connect_args
+   =========================== =
 
 Process Classes
 ===============
@@ -2013,6 +2020,7 @@ as members of SFTP client and server objects.
 Exceptions
 ==========
 
+.. autoexception:: SSHChainError
 .. autoexception:: PasswordChangeRequired
 .. autoexception:: BreakReceived
 .. autoexception:: SignalReceived
